@@ -144,16 +144,24 @@
         },
         "output": {
           "type": "object",
-          "description": "Externalized output envelope: { file, passed? }. The full payload is written to 'file'; only 'passed' stays in workflow.json for loop_controller to read directly.",
-          "required": ["file"],
+          "description": "Output envelope. Two modes determined by the engine based on output.data structure: (1) Side-effect mode — if output.data contains a 'files' array, the engine writes those files to the real repository and stores only { changed_files, summary, passed? } here. No artifact file is created. (2) Artifact mode (default) — the engine externalizes output.data to an artifact file and stores { file, passed? } here.",
           "properties": {
             "file": {
               "type": "string",
-              "description": "Path to the artifact file, relative to the workflow.json location. Content is the task's full output data."
+              "description": "Artifact mode only. Path to the artifact file, relative to the workflow.json location."
+            },
+            "changed_files": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Side-effect mode only. List of file paths written to the real repository."
+            },
+            "summary": {
+              "type": "string",
+              "description": "Side-effect mode only. Brief summary of what was done."
             },
             "passed": {
               "type": ["boolean", "null"],
-              "description": "Optional verdict flag, only for verdict-type tasks. Stays in workflow.json (not in the file). When false and a loop references output.passed, the loop triggers."
+              "description": "Optional verdict flag, only for verdict-type tasks. Present in both modes. Stays in workflow.json for loop_controller to read directly."
             }
           }
         },

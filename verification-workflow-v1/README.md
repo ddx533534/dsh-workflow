@@ -196,34 +196,61 @@ verification-workflow-v1/
 
 ### Attempt（单次执行记录）
 
+Attempt 的 `output` 有**两种模式**，由引擎根据产出结构自动判断：
+
+**模式 1：artifact 模式（默认）**——产出外置到文件：
+
 ```json
 {
-  "attempt": 2,
+  "attempt": 1,
   "status": "success",
   "output": {
-    "file": ".verification-workflow/add_login_20250903T150000/artifacts/code_attempt2.json",
+    "file": ".verification-workflow/add_login_20250903T150000/artifacts/tech_design_attempt1.json",
     "passed": false
-  },
-  "approval_status": "approved",
-  "approved_by": "human",
-  "approved_at": "2025-09-03T10:00:00Z",
-  "reject_reason": null
+  }
 }
 ```
 
-| 字段 | 说明 |
-|---|---|
-| `attempt` | 序号，从 1 开始。回环重跑时递增。 |
-| `status` | `"success"` 或 `"fail"`。审批拒绝也记为 `"fail"`。 |
-| `output.file` | 产出文件路径（相对于 workflow.json 所在目录）。完整产出数据在此文件中。 |
-| `output.passed` | 可选布尔。仅 verdict 类 task 才有。**留在 workflow.json**，不进文件。loop_controller 直接读它。 |
-| `approval_status` | 仅 `requires_approval` 的 task 才填。`null` = 未审批；`"approved"` = 通过；`"rejected"` = 拒绝。 |
-| `approved_by` / `approved_at` | 审批人 / 审批时间。审计用。 |
-| `reject_reason` | 拒绝理由。 |
+**模式 2：side-effect 模式**——产出含 `files` 字段时，引擎自动写进真实仓库，output 只存路径列表：
 
-**output 变更要点**（相对 v1 初版）：
-- `data` 字段取消。原 `output.data` 的大产出全部进文件，`output.file` 记路径。
-- `passed` 留在 workflow.json 外层，loop_controller 直接读，不用读文件。
+```json
+{
+  "attempt": 1,
+  "status": "success",
+  "output": {
+    "changed_files": ["src/auth/login.js", "src/auth/token.js"],
+    "summary": "实现了登录和 token 验证"
+  }
+}
+```
+
+| 字段 | 模式 | 说明 |
+|---|---|---|
+| `output.file` | artifact | 产出文件路径。完整产出数据在此文件中。 |
+| `output.changed_files` | side-effect | 被 code task 写进真实仓库的文件路径列表。 |
+| `output.summary` | side-effect | code task 的实现摘要。 |
+| `output.passed` | 两者皆有 | 可选布尔。仅 verdict 类 task 才有。留在 workflow.json 供 loop_controller 直接读。 |
+| `attempt` | — | 序号，从 1 开始。回环重跑时递增。 |
+| `status` | — | `"success"` 或 `"fail"`。审批拒绝也记为 `"fail"`。 |
+| `approval_status` | — | 仅 `requires_approval` 的 task 才填。 |
+| `approved_by` / `approved_at` | — | 审批人 / 审批时间。审计用。 |
+| `reject_reason` | — | 拒绝理由。 |
+
+**引擎如何判断走哪种模式**：
+
+- 产出 `data` 里有 `files` 数组 → **side-effect 模式**：引擎把每个 file 的 content 写进真实仓库，output 只存 `changed_files` + `summary`。不创建 artifact 文件。
+- 产出 `data` 里没有 `files` → **artifact 模式**：引擎把 data 外置到 artifact 文件，output 存 `file` 路径。
+
+**为什么 code task 用 side-effect 模式**：
+
+code task 的产出是"代码文件"——应该直接写进真实仓库，而不是存到 artifact 文件里再由人手动拷。写进真实仓库后：
+- 下一个 task（code_review）通过 `changed_files` 知道改了哪些文件，用 `read` 工具从真实仓库读这些文件来 review。
+- 不需要 artifact 文件做中转——文件已经在仓库里了。
+
+**gatherInput 如何处理两种模式**：
+
+- 前序 task 是 artifact 模式 → 读 artifact 文件内容作为 input。
+- 前序 task 是 side-effect 模式 → 直接传 `changed_files` + `summary` 作为 input（不读文件内容，因为内容在真实仓库里，由后继 task 自己用工具读）。
 
 ### Loop（回环配置）
 
@@ -480,17 +507,28 @@ verdict fail → 回 code 时，code 是一个**新的 Attempt**（attempt 号�
 }
 ```
 
-### workflow.json 里只存路径
+### workflow.json 里只存路径或摘要
+
+**artifact 模式**（plan 阶段 + verdict）：
 
 ```json
 "output": {
-  "file": ".verification-workflow/add_login_20250903T150000/artifacts/code_attempt1.json",
-  "passed": false
+  "file": ".verification-workflow/add_login_20250903T150000/artifacts/tech_design_attempt1.json"
 }
 ```
 
-- `file`：产出文件路径。
-- `passed`：可选，仅 verdict task 才有。loop_controller 直接读，不用读文件。
+**side-effect 模式**（code task）：
+
+```json
+"output": {
+  "changed_files": ["src/auth/login.js", "src/auth/token.js"],
+  "summary": "实现了登录和 token 验证"
+}
+```
+
+- artifact 模式：完整产出数据在 artifact 文件里，workflow.json 只存路径。
+- side-effect 模式：文件已写进真实仓库，workflow.json 只存改了哪些文件 + 摘要。
+- `passed`：两种模式都可带，仅 verdict task 才有。loop_controller 直接读，不用读文件。
 
 ---
 
@@ -568,7 +606,7 @@ node engine/loop.js --workflow <path> --step --output '<json>'
 |---|---|---|
 | `NEED_APPROVAL` | 审批门禁 task 等待用户决定 | `task`, `attempt` |
 | `NEED_SKILL` | skill 执行体等待 Agent 执行 | `task`, `ref`, `input` |
-| `DONE` | task 完成，产出已外置 | `task`, `status`, `file` |
+| `DONE` | task 完成 | `task`, `status`, `output`（artifact 模式含 `file`；side-effect 模式含 `changed_files`+`summary`） |
 | `LOOP_BACK` | 回环触发，已跳回目标 | `from`, `to`, `iteration`, `max`, `reason?` |
 | `FINISHED` | 所有 task 完成 | — |
 | `FAILED` | script task 失败 | `task`, `file` |
@@ -582,17 +620,20 @@ node engine/loop.js --workflow <path> --step --output '<json>'
 
 每个子 skill 位于 `skills/<name>/SKILL.md`，**自包含**：在 YAML frontmatter 里声明自己的 `input`/`output` JSON Schema，外加 prompt 正文。
 
-**output schema 描述的是产出文件内容的结构**（不再是 output 外壳）。Agent 产出时返回内容本身，引擎负责包装成 `{ data: <内容> }` 并写入文件。
+**output schema 描述的是产出内容的结构**（不再是 output 外壳）。Agent 产出时返回内容本身，引擎负责包装成 `{ data: <内容> }` 并处理：
 
-| 子 skill | 大阶段 | requires_approval | output 有 passed？ | 说明 |
-|---|---|---|---|---|
-| `requirement_clarification` | plan | 否 | 否 | 将模糊需求澄清为结构化规格。 |
-| `tech_design` | plan | 否 | 否 | 从澄清后的需求设计技术方案。 |
-| `test_case_design` | plan | 否 | 否 | 从技术方案设计测试用例。 |
-| `code` | code | **是** | 否 | 基于方案 + 测试用例实现代码。执行前需人工审批。 |
-| `code_review` | code | 否 | 否（有 `approved`） | 审查代码正确性与方案对齐度。 |
-| `run_test` | verify | 否 | 否 | 执行测试用例，收集结果。 |
-| `verdict` | verify | 否 | **是** | 基于测试结果判定通过/失败。`passed: false` 触发回环。 |
+- 产出含 `files` 字段 → **side-effect 模式**：引擎写进真实仓库，output 存 changed_files + summary。
+- 产出无 `files` → **artifact 模式**：引擎外置到 artifact 文件，output 存 file 路径。
+
+| 子 skill | 大阶段 | requires_approval | output 模式 | output 有 passed？ | 说明 |
+|---|---|---|---|---|---|
+| `requirement_clarification` | plan | 否 | artifact | 否 | 将模糊需求澄清为结构化规格。 |
+| `tech_design` | plan | 否 | artifact | 否 | 从澄清后的需求设计技术方案。 |
+| `test_case_design` | plan | 否 | artifact | 否 | 从技术方案设计测试用例。 |
+| `code` | code | **是** | **side-effect** | 否 | 产出 `files` → 引擎写进真实仓库。output 只存 changed_files + summary。执行前需人工审批。 |
+| `code_review` | code | 否 | artifact | 否（有 `approved`） | 从真实仓库读 changed_files 指定的文件来 review。 |
+| `run_test` | verify | 否 | artifact | 否 | 执行测试用例，收集结果。 |
+| `verdict` | verify | 否 | artifact | **是** | 基于测试结果判定通过/失败。`passed: false` 触发回环。 |
 
 只有 `verdict` 产出驱动回环的 `passed` 字段。这是有意为之：`passed` 是 verdict task 的**业务产出**，不是协议通用字段。
 
@@ -677,6 +718,11 @@ Agent 会：
 | 33 | `trigger_type` 字段区分两种触发 | 共用 checkLoops 逻辑。 |
 | 34 | 两条 loop 共享一套引擎检查逻辑 | 不搞两套回溯机制，只是 `loops` 数组里有两条配置。 |
 | 35 | 子 skill 的 output schema 描述产出文件内容 | 不再描述 output 外壳。Agent 返回内容，引擎负责包装。 |
+| 36 | code task 产出含 `files` → 引擎自动写进真实仓库 | code task 不外置 artifact，直接写真实文件。引擎按产出结构判断，不按 task 名。 |
+| 37 | side-effect 模式 output 只存 `changed_files` + `summary` | 文件已写进仓库，不需要 artifact 文件做中转。 |
+| 38 | `gatherInput` 支持两种模式 | artifact 模式读文件内容；side-effect 模式直接传 changed_files + summary。 |
+| 39 | code_review 从真实仓库读文件 | input 拿到 changed_files 路径列表，用 read 工具读真实文件来 review。 |
+| 40 | Agent 自己看仓库，引擎不自动注入 | 引擎只管编排，信息收集由 Agent 用工具自主完成。 |
 
 ---
 

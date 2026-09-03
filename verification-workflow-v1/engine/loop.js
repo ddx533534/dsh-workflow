@@ -315,13 +315,15 @@ function executeHandler(task, input, skillRoot) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Gather input for a task from its depends_on predecessors' latest artifacts.
- * Reads the artifact files (not workflow.json inline data).
+ * Gather input for a task from its depends_on predecessors' latest outputs.
+ * Two modes:
+ *   - Artifact mode (output.file): read the artifact file content.
+ *   - Side-effect mode (output.changed_files): pass changed_files + summary directly.
  *
  * @param {object} workflow
  * @param {object} task
  * @param {string} workflowDir
- * @returns {object} — keyed map of predecessor name → its last artifact data
+ * @returns {object} — keyed map of predecessor name → its last output data
  */
 function gatherInput(workflow, task, workflowDir) {
   const input = {};
@@ -329,8 +331,21 @@ function gatherInput(workflow, task, workflowDir) {
     const dep = getTask(workflow, depName);
     const hist = (dep && dep.history) || [];
     const last = hist[hist.length - 1];
-    if (last && last.status === 'success' && last.output && last.output.file) {
-      input[depName] = readArtifact(workflowDir, last.output.file);
+    if (last && last.status === 'success' && last.output) {
+      if (last.output.file) {
+        // Artifact mode: read the artifact file
+        input[depName] = readArtifact(workflowDir, last.output.file);
+      } else if (last.output.changed_files) {
+        // Side-effect mode: pass changed_files + summary directly
+        input[depName] = {
+          changed_files: last.output.changed_files,
+        };
+        if (last.output.summary) {
+          input[depName].summary = last.output.summary;
+        }
+      } else {
+        input[depName] = null;
+      }
     } else {
       input[depName] = null;
     }
@@ -360,8 +375,67 @@ function validateAgainstSchema(value, schema) {
 }
 
 /**
+ * Process a task's output: decide whether to write files to the real repo
+ * (side-effect mode) or externalize to an artifact file (default mode).
+ *
+ * Rule:
+ *   - If output.data contains a `files` array → write each file to the real
+ *     repo, store only { changed_files, summary } in the Attempt output.
+ *     No artifact file is created.
+ *   - Otherwise → externalize output.data to an artifact file, store
+ *     { file } in the Attempt output.
+ *
+ * `passed` (if present in the envelope) is always kept in the Attempt output
+ * regardless of mode, so loop_controller can read it without touching files.
+ *
+ * @param {object} workflow
+ * @param {string} workflowDir
+ * @param {string} taskName
+ * @param {number} attemptNum
+ * @param {object} outputEnvelope — { data, passed? }
+ * @returns {object} — the output object to store in the Attempt
+ */
+function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelope) {
+  const data = (outputEnvelope && outputEnvelope.data) || {};
+  const output = {};
+
+  // Check for files in data first, then at envelope top level.
+  // This handles both { data: { files: [...] } } and { files: [...] } formats.
+  const files = Array.isArray(data.files) ? data.files
+    : (Array.isArray(outputEnvelope && outputEnvelope.files) ? outputEnvelope.files : null);
+  const summary = data.summary || (outputEnvelope && outputEnvelope.summary);
+
+  if (files && files.length > 0) {
+    // Side-effect mode: write files to the real repo
+    const changedFiles = [];
+    for (const f of files) {
+      if (f.path && typeof f.content === 'string') {
+        const absPath = path.resolve(workflowDir, f.path);
+        fs.mkdirSync(path.dirname(absPath), { recursive: true });
+        fs.writeFileSync(absPath, f.content, 'utf8');
+        changedFiles.push(f.path);
+      }
+    }
+    output.changed_files = changedFiles;
+    if (summary) {
+      output.summary = summary;
+    }
+  } else {
+    // Default mode: externalize to artifact file
+    output.file = writeArtifact(workflow, workflowDir, taskName, attemptNum, data);
+  }
+
+  // Carry passed if present (stays in workflow.json, not in file)
+  if (outputEnvelope && 'passed' in outputEnvelope) {
+    output.passed = outputEnvelope.passed;
+  }
+
+  return output;
+}
+
+/**
  * Write an Attempt into the task's history.
- * The output data is externalized to an artifact file; only { file, passed? } stays in workflow.json.
+ * Uses processOutput to handle files-write vs artifact-externalize.
  *
  * @param {object} workflow
  * @param {string} workflowDir
@@ -378,22 +452,13 @@ function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, appr
   if (!task.started_at) task.started_at = now;
   task.finished_at = now;
 
-  // Externalize data to artifact file (even for failures — error info goes to file too)
-  const data = (outputEnvelope && outputEnvelope.data) || {};
-  const fileRelPath = writeArtifact(workflow, workflowDir, task.name, attemptNum, data);
+  const output = processOutput(workflow, workflowDir, task.name, attemptNum, outputEnvelope);
 
   const attempt = {
     attempt: attemptNum,
     status,
-    output: {
-      file: fileRelPath,
-    },
+    output,
   };
-
-  // Carry passed if present (stays in workflow.json, not in file)
-  if (outputEnvelope && 'passed' in outputEnvelope) {
-    attempt.output.passed = outputEnvelope.passed;
-  }
 
   // Attach approval fields if this task requires approval
   if (approval) {
@@ -685,9 +750,22 @@ function step(workflowPath, opts) {
       emit({ type: 'ERROR', message: `--output is not valid JSON: ${e.message}` });
       return;
     }
-    if (!outputEnvelope || typeof outputEnvelope !== 'object' || !('data' in outputEnvelope)) {
-      emit({ type: 'ERROR', message: 'output must be { data, passed? }; missing data' });
+    if (!outputEnvelope || typeof outputEnvelope !== 'object') {
+      emit({ type: 'ERROR', message: 'output must be a JSON object' });
       return;
+    }
+    // Normalize: if no 'data' field but has 'files' at top level, treat the whole envelope as data.
+    // This supports both { data: { files: [...] } } and { files: [...] } formats.
+    if (!('data' in outputEnvelope)) {
+      if ('files' in outputEnvelope || 'passed' in outputEnvelope) {
+        // Wrap top-level content into data
+        const { passed, ...rest } = outputEnvelope;
+        outputEnvelope = { data: rest };
+        if (passed !== undefined) outputEnvelope.passed = passed;
+      } else {
+        emit({ type: 'ERROR', message: 'output must have data or files field; got neither' });
+        return;
+      }
     }
 
     // Validate data against task.output schema if present
@@ -702,13 +780,8 @@ function step(workflowPath, opts) {
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       // Fill in the approved pending attempt with execution result
       attempt = lastAttempt;
-      const data = outputEnvelope.data;
-      const fileRelPath = writeArtifact(workflow, workflowDir, task.name, attempt.attempt, data);
       attempt.status = 'success';
-      attempt.output = { file: fileRelPath };
-      if ('passed' in outputEnvelope) {
-        attempt.output.passed = outputEnvelope.passed;
-      }
+      attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, outputEnvelope);
       const now = new Date().toISOString();
       task.finished_at = now;
     } else {
@@ -741,7 +814,7 @@ function step(workflowPath, opts) {
 
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', file: attempt.output.file });
+    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
     return;
   }
 
@@ -775,13 +848,8 @@ function step(workflowPath, opts) {
     let attempt;
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       attempt = lastAttempt;
-      const data = result.output.data;
-      const fileRelPath = writeArtifact(workflow, workflowDir, task.name, attempt.attempt, data);
       attempt.status = status;
-      attempt.output = { file: fileRelPath };
-      if ('passed' in result.output) {
-        attempt.output.passed = result.output.passed;
-      }
+      attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, result.output);
       task.finished_at = new Date().toISOString();
     } else {
       attempt = recordAttempt(workflow, workflowDir, task, status, result.output, null);
@@ -793,7 +861,7 @@ function step(workflowPath, opts) {
       ctx.terminated = true;
       ctx.terminate_reason = `task_failed: ${task.name}`;
       saveWorkflow(workflow, workflowPath);
-      emit({ type: 'FAILED', task: task.name, file: attempt.output.file });
+      emit({ type: 'FAILED', task: task.name, output: attempt.output });
       return;
     }
 
@@ -819,7 +887,7 @@ function step(workflowPath, opts) {
 
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', file: attempt.output.file });
+    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
     return;
   }
 }
