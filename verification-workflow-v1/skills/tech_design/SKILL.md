@@ -10,25 +10,22 @@ input:
   required: [requirement_clarification]
 output:
   type: object
+  description: The content of the artifact file (output.data).
   properties:
-    data:
-      type: object
-      properties:
-        tech_design:
-          type: string
-          description: The technical design document (architecture, components, data flow, key decisions).
-        key_components:
-          type: array
-          items:
-            type: string
-          description: List of key components or modules to implement.
-        tech_risks:
-          type: array
-          items:
-            type: string
-          description: Identified technical risks.
-      required: [tech_design]
-  required: [data]
+    tech_design:
+      type: string
+      description: The technical design document (architecture, components, data flow, key decisions).
+    key_components:
+      type: array
+      items:
+        type: string
+      description: List of key components or modules to implement.
+    tech_risks:
+      type: array
+      items:
+        type: string
+      description: Identified technical risks.
+  required: [tech_design]
 ---
 
 # Technical Design
@@ -48,16 +45,14 @@ You receive the `requirement_clarification` task's output (containing `clarified
 
 ## Output
 
-Return JSON matching the output schema:
+Return JSON matching the output schema. This becomes the artifact file content:
 
 ```json
 {
-  "data": {
-    "tech_design": "<full design document text>",
-    "key_components": ["<component 1>", "..."],
-    "tech_risks": ["<risk 1>", "..."]
-  }
+  "tech_design": "<full design document text>",
+  "key_components": ["<component 1>", "..."],
+  "tech_risks": ["<risk 1>", "..."]
 }
 ```
 
-Do not include a `passed` field.
+Do not include a `passed` field. Do not wrap in `{ data: ... }` — return content directly.

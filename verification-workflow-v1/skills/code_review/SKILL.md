@@ -13,33 +13,30 @@ input:
   required: [code]
 output:
   type: object
+  description: The content of the artifact file (output.data).
   properties:
-    data:
-      type: object
-      properties:
-        review_summary:
-          type: string
-          description: Overall review conclusion.
-        issues:
-          type: array
-          items:
-            type: object
-            properties:
-              severity:
-                type: string
-                enum: [blocker, major, minor, nit]
-              file:
-                type: string
-              description:
-                type: string
-              suggestion:
-                type: string
-            required: [severity, description]
-        approved:
-          type: boolean
-          description: Whether the code passes review (no blockers).
-      required: [review_summary, issues, approved]
-  required: [data]
+    review_summary:
+      type: string
+      description: Overall review conclusion.
+    issues:
+      type: array
+      items:
+        type: object
+        properties:
+          severity:
+            type: string
+            enum: [blocker, major, minor, nit]
+          file:
+            type: string
+          description:
+            type: string
+          suggestion:
+            type: string
+        required: [severity, description]
+    approved:
+      type: boolean
+      description: Whether the code passes review (no blockers).
+  required: [review_summary, issues, approved]
 ---
 
 # Code Review
@@ -61,18 +58,16 @@ You receive:
 
 ## Output
 
-Return JSON matching the output schema:
+Return JSON matching the output schema. This becomes the artifact file content:
 
 ```json
 {
-  "data": {
-    "review_summary": "...",
-    "issues": [
-      { "severity": "blocker", "file": "...", "description": "...", "suggestion": "..." }
-    ],
-    "approved": true
-  }
+  "review_summary": "...",
+  "issues": [
+    { "severity": "blocker", "file": "...", "description": "...", "suggestion": "..." }
+  ],
+  "approved": true
 }
 ```
 
-Note: this task's output has an `approved` field, not `passed`. The small code→review loop is not configured in this version; the engine treats this task as a normal success after execution.
+Note: the `approved` field here is the review result (stored in the artifact file), not the `passed` field (which is only for verdict tasks and drives loops). The small code↔review loop is not configured in this version.

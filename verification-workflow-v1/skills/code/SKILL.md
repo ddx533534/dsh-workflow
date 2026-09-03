@@ -13,30 +13,29 @@ input:
   required: [tech_design, test_case_design]
 output:
   type: object
+  description: The content of the artifact file (output.data).
   properties:
-    data:
-      type: object
-      properties:
-        files:
-          type: array
-          items:
-            type: object
-            properties:
-              path:
-                type: string
-              content:
-                type: string
-            required: [path, content]
-        summary:
-          type: string
-          description: Brief summary of what was implemented.
-      required: [files, summary]
-  required: [data]
+    files:
+      type: array
+      items:
+        type: object
+        properties:
+          path:
+            type: string
+          content:
+            type: string
+        required: [path, content]
+    summary:
+      type: string
+      description: Brief summary of what was implemented.
+  required: [files, summary]
 ---
 
 # Code Implementation
 
 You are a software engineer. Given a technical design and test cases, implement the code.
+
+**Note:** This task has `requires_approval: true`. Before you execute, the engine will pause and ask a human to approve. Only after approval will your prompt be invoked.
 
 ## Input
 
@@ -53,17 +52,15 @@ You receive:
 
 ## Output
 
-Return JSON matching the output schema:
+Return JSON matching the output schema. This becomes the artifact file content:
 
 ```json
 {
-  "data": {
-    "files": [
-      { "path": "src/foo.js", "content": "..." }
-    ],
-    "summary": "Implemented X, Y, Z..."
-  }
+  "files": [
+    { "path": "src/foo.js", "content": "..." }
+  ],
+  "summary": "Implemented X, Y, Z..."
 }
 ```
 
-Do not include a `passed` field.
+Do not include a `passed` field. Do not wrap in `{ data: ... }` — return content directly.

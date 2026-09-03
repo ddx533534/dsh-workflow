@@ -5,19 +5,25 @@
  * verification-workflow / engine/loop.js
  *
  * Single-step loop engine for the plan-code-verify workflow protocol.
+ * Supports: approval gates (requires_approval), externalized artifacts,
+ *           two loop trigger types (output_field, approval_rejected).
  *
  * Modules (co-located in this file):
  *   1. loader        — read & validate workflow.json, build in-memory object
  *   2. executor      — dispatch handler (skill → delegate to Agent; script → run directly)
  *   3. engine        — serial task driver, depends_on ordering, gather/validate input-output
- *   4. loop_controller — check loops after each task, jump_to on trigger
+ *   4. loop_controller — check loops after each task, jump_to on trigger (two trigger types)
  *   5. checkpointer  — incremental persistence of workflow.json after each Attempt
  *
  * Usage (driven by the Agent in a step loop):
  *   node loop.js --workflow <path> --step
- *     → executes the current task; for skill handlers, prints NEED_SKILL and exits
+ *     → executes the current task; skill handlers print NEED_SKILL; approval-gated tasks print NEED_APPROVAL
  *   node loop.js --workflow <path> --step --output '<json>'
- *     → feeds a skill's output back, writes the Attempt, advances
+ *     → feeds a skill's output back, writes artifact file, writes Attempt, advances
+ *   node loop.js --workflow <path> --step --approve
+ *     → approves the current approval-gated task, then proceeds to execute it
+ *   node loop.js --workflow <path> --step --reject "<reason>"
+ *     → rejects the current approval-gated task, records Attempt with status=fail, triggers approval_rejected loop
  *   node loop.js --workflow <path> --status
  *     → prints current workflow status without executing
  */
@@ -44,6 +50,12 @@ function loadWorkflow(workflowPath) {
   // --- structural validation ---
   if (workflow.version !== '1.0') {
     throw new Error(`Unsupported protocol version: ${workflow.version}`);
+  }
+  if (!workflow.run_name || typeof workflow.run_name !== 'string') {
+    throw new Error('workflow.run_name is required (English short name)');
+  }
+  if (!/^[a-z][a-z0-9_]*$/.test(workflow.run_name)) {
+    throw new Error(`workflow.run_name must match ^[a-z][a-z0-9_]*$, got: ${workflow.run_name}`);
   }
   if (!Array.isArray(workflow.phases) || workflow.phases.length === 0) {
     throw new Error('workflow.phases must be a non-empty array');
@@ -87,13 +99,20 @@ function loadWorkflow(workflowPath) {
     }
   }
 
-  // --- loops reference valid tasks ---
+  // --- loops reference valid tasks + trigger_type validity ---
   for (const loop of (workflow.loops || [])) {
+    const tt = loop.trigger_type || 'output_field';
+    if (!['output_field', 'approval_rejected'].includes(tt)) {
+      throw new Error(`Loop has invalid trigger_type: ${tt}`);
+    }
     if (!names.has(loop.trigger_task)) {
       throw new Error(`Loop trigger_task unknown: ${loop.trigger_task}`);
     }
     if (!names.has(loop.target_task)) {
       throw new Error(`Loop target_task unknown: ${loop.target_task}`);
+    }
+    if (tt === 'output_field' && !loop.trigger_field) {
+      throw new Error(`Loop with trigger_type=output_field must have trigger_field: ${loop.trigger_task}`);
     }
   }
 
@@ -118,8 +137,6 @@ function loadWorkflow(workflowPath) {
  * @returns {object[]}
  */
 function orderTasks(tasks) {
-  // Simple: respect declaration order. depends_on must point to earlier tasks.
-  // (The engine validates that depends_on targets already-ran tasks at runtime.)
   return tasks;
 }
 
@@ -134,8 +151,13 @@ function getTask(workflow, name) {
 }
 
 /**
- * Find the first task that has not yet completed (no history or last attempt failed).
- * If context.current_task is set and not yet done, resume from there.
+ * Find the next task to execute.
+ * - If context.current_task is set, resume from there.
+ * - Otherwise find the first task whose last attempt wasn't success.
+ *
+ * NOTE: A task with requires_approval that has a pending Attempt (approval_status=null)
+ * is "in progress" — findNextTask returns it so the engine can re-enter the approval flow.
+ *
  * @param {object} workflow
  * @returns {object|null}
  */
@@ -145,7 +167,7 @@ function findNextTask(workflow) {
 
   const ordered = orderTasks(workflow.tasks);
 
-  // If current_task is set, resume from it (it may have been jumped back to by a loop)
+  // If current_task is set, resume from it
   if (ctx.current_task) {
     const idx = ordered.findIndex(t => t.name === ctx.current_task);
     if (idx >= 0) {
@@ -153,7 +175,7 @@ function findNextTask(workflow) {
     }
   }
 
-  // Otherwise find the first task without a successful attempt
+  // Otherwise find the first task without a successful last attempt
   for (const t of ordered) {
     const hist = t.history || [];
     const last = hist[hist.length - 1];
@@ -162,6 +184,75 @@ function findNextTask(workflow) {
     }
   }
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ARTIFACTS — externalized output files
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Ensure artifacts_dir exists. On first execution (artifacts_dir is null),
+ * create it using run_name + current timestamp.
+ *
+ * @param {object} workflow
+ * @param {string} workflowDir — directory containing workflow.json
+ * @returns {string} — the artifacts_dir path (relative to workflowDir)
+ */
+function ensureArtifactsDir(workflow, workflowDir) {
+  if (workflow.artifacts_dir) {
+    const absArtifacts = path.resolve(workflowDir, workflow.artifacts_dir);
+    if (!fs.existsSync(absArtifacts)) {
+      fs.mkdirSync(absArtifacts, { recursive: true });
+    }
+    return workflow.artifacts_dir;
+  }
+
+  // First execution: create the directory
+  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14); // YYYYMMDDHHmmss
+  const relDir = `.verification-workflow/${workflow.run_name}_${ts}/artifacts`;
+  const absDir = path.resolve(workflowDir, relDir);
+  fs.mkdirSync(absDir, { recursive: true });
+  workflow.artifacts_dir = relDir;
+  return relDir;
+}
+
+/**
+ * Write an artifact file and return its relative path.
+ *
+ * @param {object} workflow
+ * @param {string} workflowDir
+ * @param {string} taskName
+ * @param {number} attemptNum
+ * @param {object} data — the payload to write (output.data)
+ * @returns {string} — relative path of the written file
+ */
+function writeArtifact(workflow, workflowDir, taskName, attemptNum, data) {
+  const relArtifactsDir = ensureArtifactsDir(workflow, workflowDir);
+  const filename = `${taskName}_attempt${attemptNum}.json`;
+  const relPath = path.join(relArtifactsDir, filename);
+  const absPath = path.resolve(workflowDir, relPath);
+  fs.writeFileSync(absPath, JSON.stringify(data, null, 2), 'utf8');
+  return relPath;
+}
+
+/**
+ * Read an artifact file and return its content (the data payload).
+ * Used by gatherInput to fetch predecessor outputs.
+ *
+ * @param {string} workflowDir
+ * @param {string} relFilePath
+ * @returns {object|null}
+ */
+function readArtifact(workflowDir, relFilePath) {
+  if (!relFilePath) return null;
+  const absPath = path.resolve(workflowDir, relFilePath);
+  if (!fs.existsSync(absPath)) return null;
+  const raw = fs.readFileSync(absPath, 'utf8');
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,19 +267,17 @@ function findNextTask(workflow) {
  * @param {object} task
  * @param {object} input  — assembled input data
  * @param {string} skillRoot — path to the verification-workflow skill root
- * @returns {{kind:'skill', ref:string, input:object} | {kind:'script', output:object}}
+ * @returns {{kind:'skill', ref:string, input:object} | {kind:'script', output:object, failed?:boolean}}
  */
 function executeHandler(task, input, skillRoot) {
   const handler = task.handler;
 
   if (handler.type === 'skill') {
-    // Delegate to Agent: the engine signals which skill to run and with what input.
     return { kind: 'skill', ref: handler.ref, input };
   }
 
   if (handler.type === 'script') {
     const scriptPath = path.resolve(skillRoot, handler.ref);
-    // Pass input as JSON via stdin, read JSON output from stdout.
     const inputJson = JSON.stringify(input || {});
     let stdout;
     try {
@@ -199,7 +288,6 @@ function executeHandler(task, input, skillRoot) {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (e) {
-      // Non-zero exit → fail
       return {
         kind: 'script',
         output: { data: { error: e.message, stderr: e.stderr || '' }, passed: false },
@@ -227,19 +315,22 @@ function executeHandler(task, input, skillRoot) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Gather input for a task from its depends_on predecessors' latest outputs.
+ * Gather input for a task from its depends_on predecessors' latest artifacts.
+ * Reads the artifact files (not workflow.json inline data).
+ *
  * @param {object} workflow
  * @param {object} task
- * @returns {object} — keyed map of predecessor name → its last output.data
+ * @param {string} workflowDir
+ * @returns {object} — keyed map of predecessor name → its last artifact data
  */
-function gatherInput(workflow, task) {
+function gatherInput(workflow, task, workflowDir) {
   const input = {};
   for (const depName of (task.depends_on || [])) {
     const dep = getTask(workflow, depName);
     const hist = (dep && dep.history) || [];
     const last = hist[hist.length - 1];
-    if (last && last.status === 'success') {
-      input[depName] = last.output ? last.output.data : null;
+    if (last && last.status === 'success' && last.output && last.output.file) {
+      input[depName] = readArtifact(workflowDir, last.output.file);
     } else {
       input[depName] = null;
     }
@@ -248,12 +339,10 @@ function gatherInput(workflow, task) {
 }
 
 /**
- * Minimal schema check: if task.input is set, ensure input has the required top-level keys.
- * (Full JSON Schema validation is intentionally lightweight here; a real validator lib
- *  like ajv can be swapped in without changing the call site.)
- * @param {object} input
+ * Minimal schema check.
+ * @param {object} value
  * @param {object} schema
- * @returns {true | string} — true if ok, error string if not
+ * @returns {true | string}
  */
 function validateAgainstSchema(value, schema) {
   if (!schema) return true;
@@ -271,30 +360,61 @@ function validateAgainstSchema(value, schema) {
 }
 
 /**
- * Write an Attempt into the task's history and set timestamps.
+ * Write an Attempt into the task's history.
+ * The output data is externalized to an artifact file; only { file, passed? } stays in workflow.json.
+ *
+ * @param {object} workflow
+ * @param {string} workflowDir
  * @param {object} task
  * @param {string} status — 'success' | 'fail'
- * @param {object} output — { data, passed? }
+ * @param {object} outputEnvelope — { data, passed? } from the handler/skill
+ * @param {object|null} approval — { approval_status, approved_by, approved_at, reject_reason } or null
+ * @returns {object} — the written Attempt
  */
-function recordAttempt(task, status, output) {
+function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, approval) {
   if (!task.history) task.history = [];
   const attemptNum = task.history.length + 1;
   const now = new Date().toISOString();
   if (!task.started_at) task.started_at = now;
   task.finished_at = now;
-  task.history.push({ attempt: attemptNum, status, output });
+
+  // Externalize data to artifact file (even for failures — error info goes to file too)
+  const data = (outputEnvelope && outputEnvelope.data) || {};
+  const fileRelPath = writeArtifact(workflow, workflowDir, task.name, attemptNum, data);
+
+  const attempt = {
+    attempt: attemptNum,
+    status,
+    output: {
+      file: fileRelPath,
+    },
+  };
+
+  // Carry passed if present (stays in workflow.json, not in file)
+  if (outputEnvelope && 'passed' in outputEnvelope) {
+    attempt.output.passed = outputEnvelope.passed;
+  }
+
+  // Attach approval fields if this task requires approval
+  if (approval) {
+    attempt.approval_status = approval.approval_status;
+    attempt.approved_by = approval.approved_by || null;
+    attempt.approved_at = approval.approved_at || null;
+    attempt.reject_reason = approval.reject_reason || null;
+  }
+
+  task.history.push(attempt);
+  return attempt;
 }
 
 /**
  * Advance context.current_task to the next uncompleted task.
- * Called after a successful attempt (or after a failed attempt that doesn't trigger a loop).
  * @param {object} workflow
  * @param {object} justFinishedTask
  */
 function advance(workflow, justFinishedTask) {
   const ordered = orderTasks(workflow.tasks);
   const idx = ordered.findIndex(t => t.name === justFinishedTask.name);
-  // Find next task whose last attempt isn't success
   for (let i = idx + 1; i < ordered.length; i++) {
     const t = ordered[i];
     const hist = t.history || [];
@@ -305,18 +425,20 @@ function advance(workflow, justFinishedTask) {
       return;
     }
   }
-  // Nothing left
   workflow.context.current_task = null;
   workflow.context.current_phase = null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. LOOP_CONTROLLER — check loops, jump_to on trigger
+// 4. LOOP_CONTROLLER — check loops, jump_to on trigger (two trigger types)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Check all loops against the just-completed task.
- * If a loop triggers, set context.current_task back to target_task (jump_to).
+ *
+ * Two trigger types:
+ *   - output_field: read trigger_field from last Attempt, compare to trigger_when.
+ *   - approval_rejected: check if last Attempt approval_status == 'rejected'.
  *
  * @param {object} workflow
  * @param {object} task — the task that just finished
@@ -327,14 +449,21 @@ function checkLoops(workflow, task) {
   for (const loop of loops) {
     if (loop.trigger_task !== task.name) continue;
 
-    // Read trigger_field from the task's last attempt output.
-    // Path like "output.passed"
     const hist = task.history || [];
     const last = hist[hist.length - 1];
     if (!last) continue;
 
-    const fieldValue = resolvePath(last, loop.trigger_field);
-    if (fieldValue === loop.trigger_when) {
+    const triggerType = loop.trigger_type || 'output_field';
+    let shouldTrigger = false;
+
+    if (triggerType === 'output_field') {
+      const fieldValue = resolvePath(last, loop.trigger_field);
+      shouldTrigger = (fieldValue === loop.trigger_when);
+    } else if (triggerType === 'approval_rejected') {
+      shouldTrigger = (last.approval_status === 'rejected');
+    }
+
+    if (shouldTrigger) {
       const loopKey = `${loop.trigger_task}→${loop.target_task}`;
       const counts = workflow.context.loop_counts || {};
       const current = counts[loopKey] || 0;
@@ -343,10 +472,28 @@ function checkLoops(workflow, task) {
       }
       counts[loopKey] = current + 1;
       workflow.context.loop_counts = counts;
-      // jump_to: move execution pointer back to target_task
       const target = getTask(workflow, loop.target_task);
       workflow.context.current_task = target.name;
       workflow.context.current_phase = target.phase;
+
+      // Mark all tasks AFTER target_task (in declaration order) as stale.
+      // Their previous results were based on stale predecessor outputs.
+      // We keep the history for audit but mark each Attempt as stale so
+      // findNextTask/advance know to re-run them.
+      // For simplicity, we clear started_at/finished_at and mark last attempt
+      // as stale by setting a flag. But since we want to keep it simple:
+      // we clear history of downstream tasks (they will be re-run fresh).
+      // The rejected/failed attempts on the trigger task itself are preserved.
+      const ordered = orderTasks(workflow.tasks);
+      const targetIdx = ordered.findIndex(t => t.name === target.name);
+      for (let i = targetIdx + 1; i < ordered.length; i++) {
+        // Clear downstream task history — they need full re-run.
+        // Their previous artifacts remain on disk for reference.
+        ordered[i].history = [];
+        ordered[i].started_at = null;
+        ordered[i].finished_at = null;
+      }
+
       return { triggered: true, loop };
     }
   }
@@ -371,7 +518,7 @@ function resolvePath(obj, dotted) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Save the workflow state back to its JSON file (incremental, after every Attempt).
+ * Save the workflow state back to its JSON file (atomic write).
  * @param {object} workflow
  * @param {string} workflowPath
  */
@@ -388,19 +535,26 @@ function saveWorkflow(workflow, workflowPath) {
 /**
  * Run one step of the workflow.
  *
- * Modes:
- *  (a) --step without --output: the engine looks at current_task.
- *      - script handler: execute, write Attempt, save, advance, print DONE.
- *      - skill handler:  print NEED_SKILL and exit (Agent will execute and call back).
- *  (b) --step with --output '<json>': the engine writes the Attempt for the current
- *      skill task using the provided output, then saves, checks loops, advances.
+ * Modes (all via --step):
+ *  (a) Plain --step:
+ *      - If task.requires_approval and no pending Attempt with approval_status=null → create pending Attempt, output NEED_APPROVAL.
+ *      - If task.requires_approval and there IS a pending Attempt (approval_status=null) → output NEED_APPROVAL (re-ask).
+ *      - If skill handler (and not approval-gated or already approved) → output NEED_SKILL.
+ *      - If script handler → execute, write artifact, write Attempt, check loops, advance.
+ *  (b) --step --approve:
+ *      - Set the pending Attempt's approval_status=approved, then execute the task.
+ *  (c) --step --reject "<reason>":
+ *      - Set the pending Attempt's approval_status=rejected, status=fail, write Attempt, check loops (approval_rejected).
+ *  (d) --step --output '<json>':
+ *      - Write the skill's output to artifact file, write Attempt, check loops, advance.
  *
  * @param {string} workflowPath
- * @param {string|null} outputJson — provided when Agent feeds back a skill result
+ * @param {object} opts — { outputJson, approve, rejectReason }
  */
-function step(workflowPath, outputJson) {
+function step(workflowPath, opts) {
+  const { outputJson, approve, rejectReason } = opts;
   const { workflow, workflowDir } = loadWorkflow(workflowPath);
-  const skillRoot = workflowDir; // workflow.json lives at the skill root
+  const skillRoot = workflowDir;
   const ctx = workflow.context;
 
   if (ctx.terminated) {
@@ -417,31 +571,151 @@ function step(workflowPath, outputJson) {
     return;
   }
 
-  // Set current pointers
   ctx.current_task = task.name;
   ctx.current_phase = task.phase;
 
-  // ── Mode (b): Agent feeds back a skill output ──
+  // ── Ensure artifacts_dir is set on first execution ──
+  ensureArtifactsDir(workflow, workflowDir);
+
+  // ── Get or create the "current" Attempt for this task ──
+  // The current Attempt is the last one in history if it's still pending (no result yet),
+  // or a new one if the last one has a result.
+  const hist = task.history || [];
+  const lastAttempt = hist[hist.length - 1];
+  const hasPendingAttempt = lastAttempt && !('status' in lastAttempt);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // APPROVAL FLOW (only for tasks with requires_approval=true)
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (task.requires_approval) {
+    // Find the pending attempt (approval_status === null)
+    const pendingAttempt = lastAttempt && lastAttempt.approval_status === null ? lastAttempt : null;
+
+    if (rejectReason !== null && rejectReason !== undefined) {
+      // ── Mode (c): --reject ──
+      if (!pendingAttempt) {
+        emit({ type: 'ERROR', message: `Cannot reject: no pending approval for task '${task.name}'` });
+        return;
+      }
+      const now = new Date().toISOString();
+      pendingAttempt.approval_status = 'rejected';
+      pendingAttempt.approved_at = now;
+      pendingAttempt.reject_reason = rejectReason;
+      pendingAttempt.status = 'fail';
+      task.finished_at = now;
+      saveWorkflow(workflow, workflowPath);
+
+      // Check loops — approval_rejected type will trigger
+      const loopResult = checkLoops(workflow, task);
+      if (loopResult.exhausted) {
+        ctx.terminated = true;
+        ctx.terminate_reason = `max_iterations_exceeded: ${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`;
+        saveWorkflow(workflow, workflowPath);
+        emit({ type: 'TERMINATED', reason: ctx.terminate_reason });
+        return;
+      }
+      if (loopResult.triggered) {
+        saveWorkflow(workflow, workflowPath);
+        emit({
+          type: 'LOOP_BACK',
+          from: task.name,
+          to: loopResult.loop.target_task,
+          iteration: workflow.context.loop_counts[`${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`],
+          max: loopResult.loop.max_iterations,
+          reason: 'approval_rejected',
+        });
+        return;
+      }
+      // No loop configured for rejection — terminate
+      ctx.terminated = true;
+      ctx.terminate_reason = `approval_rejected_no_loop: ${task.name}`;
+      saveWorkflow(workflow, workflowPath);
+      emit({ type: 'TERMINATED', reason: ctx.terminate_reason });
+      return;
+    }
+
+    if (approve) {
+      // ── Mode (b): --approve ──
+      if (!pendingAttempt) {
+        emit({ type: 'ERROR', message: `Cannot approve: no pending approval for task '${task.name}'` });
+        return;
+      }
+      pendingAttempt.approval_status = 'approved';
+      pendingAttempt.approved_at = new Date().toISOString();
+      pendingAttempt.approved_by = 'human';
+      saveWorkflow(workflow, workflowPath);
+      // Now fall through to normal execution below
+    } else if (outputJson === null || outputJson === undefined) {
+      // ── Mode (a): no output, no approve, no reject → need approval ──
+      if (!pendingAttempt) {
+        // Create a pending Attempt (no status yet, just approval_status=null)
+        if (!task.history) task.history = [];
+        const attemptNum = task.history.length + 1;
+        const now = new Date().toISOString();
+        if (!task.started_at) task.started_at = now;
+        const pendingAttemptObj = {
+          attempt: attemptNum,
+          approval_status: null,
+          approved_by: null,
+          approved_at: null,
+          reject_reason: null,
+        };
+        task.history.push(pendingAttemptObj);
+        task.finished_at = now;
+        saveWorkflow(workflow, workflowPath);
+        emit({ type: 'NEED_APPROVAL', task: task.name, attempt: attemptNum });
+        return;
+      } else {
+        // Pending attempt already exists — re-ask
+        emit({ type: 'NEED_APPROVAL', task: task.name, attempt: pendingAttempt.attempt });
+        return;
+      }
+    }
+    // If approved, fall through to execution
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // OUTPUT FEEDBACK MODE (d): Agent feeds back a skill result
+  // ═══════════════════════════════════════════════════════════════════════════
   if (outputJson !== null && outputJson !== undefined) {
-    let output;
+    let outputEnvelope;
     try {
-      output = JSON.parse(outputJson);
+      outputEnvelope = JSON.parse(outputJson);
     } catch (e) {
       emit({ type: 'ERROR', message: `--output is not valid JSON: ${e.message}` });
       return;
     }
-    // Validate output envelope: must have data, optional passed
-    if (!output || typeof output !== 'object' || !('data' in output)) {
+    if (!outputEnvelope || typeof outputEnvelope !== 'object' || !('data' in outputEnvelope)) {
       emit({ type: 'ERROR', message: 'output must be { data, passed? }; missing data' });
       return;
     }
-    // Validate against task.output schema if present
-    const v = validateAgainstSchema(output, task.output);
+
+    // Validate data against task.output schema if present
+    const v = validateAgainstSchema(outputEnvelope.data, task.output);
     if (v !== true) {
       emit({ type: 'ERROR', message: `output schema validation failed: ${v}` });
       return;
     }
-    recordAttempt(task, 'success', output);
+
+    // Find the pending attempt (for approval tasks, this is the approved one; for others, create new)
+    let attempt;
+    if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
+      // Fill in the approved pending attempt with execution result
+      attempt = lastAttempt;
+      const data = outputEnvelope.data;
+      const fileRelPath = writeArtifact(workflow, workflowDir, task.name, attempt.attempt, data);
+      attempt.status = 'success';
+      attempt.output = { file: fileRelPath };
+      if ('passed' in outputEnvelope) {
+        attempt.output.passed = outputEnvelope.passed;
+      }
+      const now = new Date().toISOString();
+      task.finished_at = now;
+    } else {
+      // Normal task: record a fresh attempt
+      attempt = recordAttempt(workflow, workflowDir, task, 'success', outputEnvelope, null);
+    }
+
     saveWorkflow(workflow, workflowPath);
 
     // Check loops
@@ -465,17 +739,17 @@ function step(workflowPath, outputJson) {
       return;
     }
 
-    // Advance to next task
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success' });
+    emit({ type: 'DONE', task: task.name, status: 'success', file: attempt.output.file });
     return;
   }
 
-  // ── Mode (a): execute or delegate ──
-  const input = gatherInput(workflow, task);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EXECUTION MODE (a): execute or delegate
+  // ═══════════════════════════════════════════════════════════════════════════
+  const input = gatherInput(workflow, task, workflowDir);
 
-  // Validate input if schema present
   const iv = validateAgainstSchema(input, task.input);
   if (iv !== true) {
     emit({ type: 'ERROR', message: `input schema validation failed: ${iv}` });
@@ -485,7 +759,6 @@ function step(workflowPath, outputJson) {
   const result = executeHandler(task, input, skillRoot);
 
   if (result.kind === 'skill') {
-    // Delegate: tell the Agent which skill to run and with what input
     emit({
       type: 'NEED_SKILL',
       task: task.name,
@@ -497,19 +770,33 @@ function step(workflowPath, outputJson) {
 
   if (result.kind === 'script') {
     const status = result.failed ? 'fail' : 'success';
-    recordAttempt(task, status, result.output);
+
+    // For approval tasks, fill the pending approved attempt; otherwise record fresh
+    let attempt;
+    if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
+      attempt = lastAttempt;
+      const data = result.output.data;
+      const fileRelPath = writeArtifact(workflow, workflowDir, task.name, attempt.attempt, data);
+      attempt.status = status;
+      attempt.output = { file: fileRelPath };
+      if ('passed' in result.output) {
+        attempt.output.passed = result.output.passed;
+      }
+      task.finished_at = new Date().toISOString();
+    } else {
+      attempt = recordAttempt(workflow, workflowDir, task, status, result.output, null);
+    }
+
     saveWorkflow(workflow, workflowPath);
 
     if (status === 'fail') {
-      // A failed script task terminates the workflow (no loop configured for script fails here)
       ctx.terminated = true;
       ctx.terminate_reason = `task_failed: ${task.name}`;
       saveWorkflow(workflow, workflowPath);
-      emit({ type: 'FAILED', task: task.name, output: result.output });
+      emit({ type: 'FAILED', task: task.name, file: attempt.output.file });
       return;
     }
 
-    // Check loops (scripts could also drive loops if their output has passed)
     const loopResult = checkLoops(workflow, task);
     if (loopResult.exhausted) {
       ctx.terminated = true;
@@ -532,7 +819,7 @@ function step(workflowPath, outputJson) {
 
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success' });
+    emit({ type: 'DONE', task: task.name, status: 'success', file: attempt.output.file });
     return;
   }
 }
@@ -548,17 +835,24 @@ function status(workflowPath) {
     type: 'STATUS',
     current_task: task ? task.name : null,
     current_phase: task ? task.phase : null,
+    artifacts_dir: workflow.artifacts_dir,
     terminated: workflow.context.terminated,
     terminate_reason: workflow.context.terminate_reason,
     loop_counts: workflow.context.loop_counts,
-    task_progress: workflow.tasks.map(t => ({
-      name: t.name,
-      phase: t.phase,
-      attempts: (t.history || []).length,
-      last_status: (t.history || []).slice(-1)[0]?.status || 'pending',
-      started_at: t.started_at || null,
-      finished_at: t.finished_at || null,
-    })),
+    task_progress: workflow.tasks.map(t => {
+      const hist = t.history || [];
+      const last = hist[hist.length - 1];
+      return {
+        name: t.name,
+        phase: t.phase,
+        requires_approval: t.requires_approval || false,
+        attempts: hist.length,
+        last_status: last ? (last.status || 'pending_approval') : 'pending',
+        last_approval_status: last ? (last.approval_status || null) : null,
+        started_at: t.started_at || null,
+        finished_at: t.finished_at || null,
+      };
+    }),
   });
 }
 
@@ -567,18 +861,19 @@ function status(workflowPath) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function emit(obj) {
-  // All engine output is a single JSON line on stdout for the Agent to parse.
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
 
 function parseArgs(argv) {
-  const args = { workflow: null, step: false, status: false, output: null };
+  const args = { workflow: null, step: false, status: false, output: null, approve: false, reject: null };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--workflow') { args.workflow = argv[++i]; }
     else if (a === '--step') { args.step = true; }
     else if (a === '--status') { args.status = true; }
     else if (a === '--output') { args.output = argv[++i]; }
+    else if (a === '--approve') { args.approve = true; }
+    else if (a === '--reject') { args.reject = argv[++i]; }
   }
   return args;
 }
@@ -597,7 +892,11 @@ function main() {
     if (args.status) {
       status(args.workflow);
     } else if (args.step) {
-      step(args.workflow, args.output);
+      step(args.workflow, {
+        outputJson: args.output,
+        approve: args.approve,
+        rejectReason: args.reject,
+      });
     } else {
       emit({ type: 'ERROR', message: 'Must specify --step or --status' });
       process.exit(1);

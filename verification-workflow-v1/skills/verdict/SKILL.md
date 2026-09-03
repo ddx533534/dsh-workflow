@@ -10,26 +10,20 @@ input:
   required: [run_test]
 output:
   type: object
+  description: The content of the artifact file (output.data).
   properties:
-    data:
-      type: object
-      properties:
-        verdict:
-          type: string
-          description: Human-readable verdict conclusion.
-        failed_tests:
-          type: array
-          items:
-            type: string
-          description: Names of tests that failed.
-        reason:
-          type: string
-          description: Why the verdict is pass or fail.
-      required: [verdict, reason]
-    passed:
-      type: boolean
-      description: The overall pass/fail flag. When false, the configured loop triggers a backtrack to 'code'.
-  required: [data, passed]
+    verdict:
+      type: string
+      description: Human-readable verdict conclusion.
+    failed_tests:
+      type: array
+      items:
+        type: string
+      description: Names of tests that failed.
+    reason:
+      type: string
+      description: Why the verdict is pass or fail.
+  required: [verdict, reason]
 ---
 
 # Verdict
@@ -49,7 +43,7 @@ You receive the `run_test` task's output (test results and summary).
 
 ## Output
 
-Return JSON matching the output schema. **You MUST include the `passed` field** — it drives the loop:
+Return JSON with both `data` (artifact file content) and `passed` (stays in workflow.json):
 
 ```json
 {
@@ -75,4 +69,6 @@ Or on failure:
 }
 ```
 
-The `passed: false` value triggers the loop configured in workflow.json, which backtracks to the `code` task (up to `max_iterations` times).
+The `data` part goes to the artifact file. The `passed` boolean is extracted by the engine and stored in workflow.json (not in the file) to drive the loop. When `passed: false`, the loop backtracks to the `code` task (up to `max_iterations` times).
+
+**This is the only task that must include `passed` alongside `data`.** All other tasks return only the content (no `data` wrapper, no `passed`).

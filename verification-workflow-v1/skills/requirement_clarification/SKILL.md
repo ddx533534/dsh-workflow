@@ -10,25 +10,22 @@ input:
   required: [raw_requirement]
 output:
   type: object
+  description: The content of the artifact file (output.data). The engine wraps this as { data: <this> } internally.
   properties:
-    data:
-      type: object
-      properties:
-        clarified_requirement:
-          type: string
-          description: The refined, unambiguous requirement statement.
-        assumptions:
-          type: array
-          items:
-            type: string
-          description: Assumptions made during clarification.
-        open_questions:
-          type: array
-          items:
-            type: string
-          description: Questions that still need user input, if any.
-      required: [clarified_requirement]
-  required: [data]
+    clarified_requirement:
+      type: string
+      description: The refined, unambiguous requirement statement.
+    assumptions:
+      type: array
+      items:
+        type: string
+      description: Assumptions made during clarification.
+    open_questions:
+      type: array
+      items:
+        type: string
+      description: Questions that still need user input, if any.
+  required: [clarified_requirement]
 ---
 
 # Requirement Clarification
@@ -47,16 +44,14 @@ You receive a `raw_requirement` string. Read it carefully.
 
 ## Output
 
-Return JSON matching the output schema:
+Return JSON matching the output schema. This JSON becomes the content of the artifact file. The engine wraps it as `{ data: <your output> }`:
 
 ```json
 {
-  "data": {
-    "clarified_requirement": "<precise requirement statement>",
-    "assumptions": ["<assumption 1>", "..."],
-    "open_questions": ["<question 1>", "..."]
-  }
+  "clarified_requirement": "<precise requirement statement>",
+  "assumptions": ["<assumption 1>", "..."],
+  "open_questions": ["<question 1>", "..."]
 }
 ```
 
-Do not include a `passed` field — this task is not a verdict task.
+Do not include a `passed` field — this task is not a verdict task. Do not wrap your output in `{ data: ... }` — return the content directly; the engine handles the wrapping.

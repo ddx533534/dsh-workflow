@@ -10,29 +10,26 @@ input:
   required: [tech_design]
 output:
   type: object
+  description: The content of the artifact file (output.data).
   properties:
-    data:
-      type: object
-      properties:
-        test_cases:
-          type: array
-          items:
-            type: object
-            properties:
-              name:
-                type: string
-              description:
-                type: string
-              input:
-                description: Test input (any structure).
-              expected:
-                description: Expected result (any structure).
-            required: [name, description, expected]
-        coverage_notes:
-          type: string
-          description: Notes on what the test cases cover and what they do not.
-      required: [test_cases]
-  required: [data]
+    test_cases:
+      type: array
+      items:
+        type: object
+        properties:
+          name:
+            type: string
+          description:
+            type: string
+          input:
+            description: Test input (any structure).
+          expected:
+            description: Expected result (any structure).
+        required: [name, description, expected]
+    coverage_notes:
+      type: string
+      description: Notes on what the test cases cover and what they do not.
+  required: [test_cases]
 ---
 
 # Test Case Design
@@ -52,17 +49,15 @@ You receive the `tech_design` task's output (containing `tech_design`, `key_comp
 
 ## Output
 
-Return JSON matching the output schema:
+Return JSON matching the output schema. This becomes the artifact file content:
 
 ```json
 {
-  "data": {
-    "test_cases": [
-      { "name": "...", "description": "...", "input": {...}, "expected": {...} }
-    ],
-    "coverage_notes": "..."
-  }
+  "test_cases": [
+    { "name": "...", "description": "...", "input": {...}, "expected": {...} }
+  ],
+  "coverage_notes": "..."
 }
 ```
 
-Do not include a `passed` field.
+Do not include a `passed` field. Do not wrap in `{ data: ... }` — return content directly.

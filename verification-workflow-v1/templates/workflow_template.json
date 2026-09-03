@@ -1,5 +1,7 @@
 {
   "version": "1.0",
+  "run_name": "default_workflow",
+  "artifacts_dir": null,
   "phases": [
     {
       "name": "plan",
@@ -49,7 +51,8 @@
         "type": "skill",
         "ref": "skills/code"
       },
-      "depends_on": ["test_case_design"]
+      "depends_on": ["test_case_design"],
+      "requires_approval": true
     },
     {
       "name": "code_review",
@@ -81,11 +84,18 @@
   ],
   "loops": [
     {
+      "trigger_type": "output_field",
       "trigger_task": "verdict",
       "trigger_field": "output.passed",
       "trigger_when": false,
       "target_task": "code",
       "max_iterations": 3
+    },
+    {
+      "trigger_type": "approval_rejected",
+      "trigger_task": "code",
+      "target_task": "tech_design",
+      "max_iterations": 2
     }
   ],
   "context": {
