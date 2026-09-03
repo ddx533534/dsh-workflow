@@ -1,0 +1,98 @@
+{
+  "version": "1.0",
+  "phases": [
+    {
+      "name": "plan",
+      "tasks": ["requirement_clarification", "tech_design", "test_case_design"]
+    },
+    {
+      "name": "code",
+      "tasks": ["code", "code_review"]
+    },
+    {
+      "name": "verify",
+      "tasks": ["run_test", "verdict"]
+    }
+  ],
+  "tasks": [
+    {
+      "name": "requirement_clarification",
+      "phase": "plan",
+      "handler": {
+        "type": "skill",
+        "ref": "skills/requirement_clarification"
+      },
+      "depends_on": []
+    },
+    {
+      "name": "tech_design",
+      "phase": "plan",
+      "handler": {
+        "type": "skill",
+        "ref": "skills/tech_design"
+      },
+      "depends_on": ["requirement_clarification"]
+    },
+    {
+      "name": "test_case_design",
+      "phase": "plan",
+      "handler": {
+        "type": "skill",
+        "ref": "skills/test_case_design"
+      },
+      "depends_on": ["tech_design"]
+    },
+    {
+      "name": "code",
+      "phase": "code",
+      "handler": {
+        "type": "skill",
+        "ref": "skills/code"
+      },
+      "depends_on": ["test_case_design"]
+    },
+    {
+      "name": "code_review",
+      "phase": "code",
+      "handler": {
+        "type": "skill",
+        "ref": "skills/code_review"
+      },
+      "depends_on": ["code"]
+    },
+    {
+      "name": "run_test",
+      "phase": "verify",
+      "handler": {
+        "type": "skill",
+        "ref": "skills/run_test"
+      },
+      "depends_on": ["code_review"]
+    },
+    {
+      "name": "verdict",
+      "phase": "verify",
+      "handler": {
+        "type": "skill",
+        "ref": "skills/verdict"
+      },
+      "depends_on": ["run_test"]
+    }
+  ],
+  "loops": [
+    {
+      "trigger_task": "verdict",
+      "trigger_field": "output.passed",
+      "trigger_when": false,
+      "target_task": "code",
+      "max_iterations": 3
+    }
+  ],
+  "context": {
+    "current_phase": null,
+    "current_task": null,
+    "loop_counts": {},
+    "terminated": false,
+    "terminate_reason": null
+  }
+}

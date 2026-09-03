@@ -1,0 +1,5 @@
+interface:
+  display_name: "Verification Workflow"
+  short_description: "Protocol-driven plan-code-verify loop"
+policy:
+  allow_implicit_invocation: false

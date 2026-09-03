@@ -1,0 +1,203 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://verification-workflow/protocol/schema.json",
+  "title": "Verification Workflow Protocol",
+  "description": "Protocol schema for a plan-code-verify loop workflow with configurable phases, tasks, and loops.",
+  "type": "object",
+  "required": ["version", "phases", "tasks"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Protocol version for forward compatibility.",
+      "const": "1.0"
+    },
+    "phases": {
+      "type": "array",
+      "description": "Major phases in execution order. Extensible: add more phases (e.g. 'deploy') as needed.",
+      "items": { "$ref": "#/definitions/Phase" }
+    },
+    "tasks": {
+      "type": "array",
+      "description": "All tasks across all phases, in execution order.",
+      "items": { "$ref": "#/definitions/Task" }
+    },
+    "loops": {
+      "type": "array",
+      "description": "Global loop configurations. Each loop can cross phases. Optional.",
+      "items": { "$ref": "#/definitions/Loop" }
+    },
+    "context": {
+      "$ref": "#/definitions/Context",
+      "description": "Runtime context. Populated by the engine during execution, not in declarations."
+    }
+  },
+  "definitions": {
+    "Phase": {
+      "type": "object",
+      "description": "A major phase (e.g. plan, code, verify).",
+      "required": ["name", "tasks"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Phase identifier. Not a fixed enum — extensible to support future phases like 'deploy'."
+        },
+        "tasks": {
+          "type": "array",
+          "description": "Task names belonging to this phase, in execution order.",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "Task": {
+      "type": "object",
+      "description": "A concrete task (minor phase). The core protocol unit.",
+      "required": ["name", "phase", "handler"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Globally unique task identifier. Combined with 'phase' uniquely identifies the task."
+        },
+        "phase": {
+          "type": "string",
+          "description": "The major phase this task belongs to."
+        },
+        "handler": { "$ref": "#/definitions/Handler" },
+        "depends_on": {
+          "type": "array",
+          "description": "Predecessor task names. Tasks execute serially; depends_on declares explicit ordering.",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "input": {
+          "description": "JSON Schema describing the input contract. Optional. If the handler is a skill, the skill's own SKILL.md may declare this; workflow.json may omit it and trust the skill."
+        },
+        "output": {
+          "description": "JSON Schema describing the output contract. Optional. Same self-contained rule as input."
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Runtime. Timestamp of first execution attempt."
+        },
+        "finished_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Runtime. Timestamp of last execution attempt completion."
+        },
+        "history": {
+          "type": "array",
+          "description": "Runtime. Execution history, one Attempt per run. Loop re-runs append; never overwrite.",
+          "items": { "$ref": "#/definitions/Attempt" }
+        }
+      }
+    },
+    "Handler": {
+      "type": "object",
+      "description": "The execution body of a task.",
+      "required": ["type", "ref"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["skill", "script"],
+          "description": "skill = a sub-skill under skills/, executed by the Agent reading its SKILL.md prompt. script = an external script executed via bash."
+        },
+        "ref": {
+          "type": "string",
+          "description": "Relative path from the verification-workflow skill root. For skill type: e.g. 'skills/requirement_clarification'. For script type: e.g. 'scripts/run_test.py'."
+        }
+      }
+    },
+    "Attempt": {
+      "type": "object",
+      "description": "A single execution record of a task.",
+      "required": ["attempt", "status", "output"],
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Attempt number, starting from 1. Increments on loop re-runs."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "fail"],
+          "description": "Execution outcome. Only these two states."
+        },
+        "output": {
+          "type": "object",
+          "description": "Unified output envelope: { data, passed? }. data is the real payload (any structure). passed is optional, only for verdict-type tasks that drive loops.",
+          "required": ["data"],
+          "properties": {
+            "data": {
+              "description": "The actual payload. Structure defined by the task's output schema."
+            },
+            "passed": {
+              "type": ["boolean", "null"],
+              "description": "Optional verdict flag. When false and a loop references this field, the loop triggers."
+            }
+          }
+        }
+      }
+    },
+    "Loop": {
+      "type": "object",
+      "description": "A loop/backtrack configuration. Lives at the Workflow level (not Phase), since loops can cross phases.",
+      "required": ["trigger_task", "trigger_field", "trigger_when", "target_task", "max_iterations"],
+      "additionalProperties": false,
+      "properties": {
+        "trigger_task": {
+          "type": "string",
+          "description": "Task name whose output is checked for the loop condition."
+        },
+        "trigger_field": {
+          "type": "string",
+          "description": "Dotted path into the trigger task's last Attempt output. e.g. 'output.passed'."
+        },
+        "trigger_when": {
+          "description": "The value that triggers the loop when the field equals this. Typically false for boolean fields. Type matches the field's type."
+        },
+        "target_task": {
+          "type": "string",
+          "description": "Task name to jump back to when the loop triggers."
+        },
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum loop iterations before terminating the workflow."
+        }
+      }
+    },
+    "Context": {
+      "type": "object",
+      "description": "Runtime execution context. Populated by the engine.",
+      "properties": {
+        "current_phase": {
+          "type": "string",
+          "description": "The phase of the task currently being executed."
+        },
+        "current_task": {
+          "type": "string",
+          "description": "The task currently being executed, or null if finished."
+        },
+        "loop_counts": {
+          "type": "object",
+          "description": "Map of loop_key -> count of times triggered. Key format: '<trigger_task>→<target_task>'.",
+          "additionalProperties": { "type": "integer" }
+        },
+        "terminated": {
+          "type": "boolean",
+          "description": "Whether the workflow has terminated."
+        },
+        "terminate_reason": {
+          "type": ["string", "null"],
+          "description": "Why the workflow terminated. e.g. 'max_iterations_exceeded', 'task_failed'."
+        }
+      }
+    }
+  }
+}
