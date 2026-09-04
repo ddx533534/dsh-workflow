@@ -2,6 +2,7 @@
   "version": "1.0",
   "run_name": "default_workflow",
   "artifacts_dir": null,
+  "max_backtrack_per_task": 3,
   "phases": [
     {
       "name": "plan",
@@ -102,6 +103,8 @@
     "current_phase": null,
     "current_task": null,
     "loop_counts": {},
+    "backtrack_counts": {},
+    "backtrack_log": [],
     "terminated": false,
     "terminate_reason": null
   }

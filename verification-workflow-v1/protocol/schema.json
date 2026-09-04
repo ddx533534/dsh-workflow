@@ -36,6 +36,12 @@
       "description": "Global loop configurations. Each loop can cross phases. Two trigger types: output_field (read task output) and approval_rejected (check approval status). Optional.",
       "items": { "$ref": "#/definitions/Loop" }
     },
+    "max_backtrack_per_task": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "description": "Max times each task can initiate a request_backtrack. Per-task counting: each task has its own budget regardless of which target it backtracks to."
+    },
     "context": {
       "$ref": "#/definitions/Context",
       "description": "Runtime context. Populated by the engine during execution, not in declarations."
@@ -162,6 +168,21 @@
             "passed": {
               "type": ["boolean", "null"],
               "description": "Optional verdict flag, only for verdict-type tasks. Present in both modes. Stays in workflow.json for loop_controller to read directly."
+            },
+            "request_backtrack": {
+              "type": ["object", "null"],
+              "description": "Optional. When the LLM discovers a problem in a predecessor's output, it can request the engine to backtrack. Extracted from output.data by the engine, stays in workflow.json. The engine checks target validity, per-task count limit, and jump_to if allowed.",
+              "properties": {
+                "to": {
+                  "type": "string",
+                  "description": "Target task name to backtrack to. Must be a predecessor of the current task."
+                },
+                "reason": {
+                  "type": "string",
+                  "description": "Why the backtrack is needed."
+                }
+              },
+              "required": ["to", "reason"]
             }
           }
         },
@@ -239,6 +260,26 @@
           "type": "object",
           "description": "Map of loop_key -> count of times triggered. Key format: '<trigger_task>→<target_task>'. Each loop counts independently.",
           "additionalProperties": { "type": "integer" }
+        },
+        "backtrack_counts": {
+          "type": "object",
+          "description": "Map of task_name -> count of request_backtrack initiated by that task. Per-task counting: each task has its own budget (max_backtrack_per_task), regardless of which target it backtracks to. Independent from loop_counts.",
+          "additionalProperties": { "type": "integer" }
+        },
+        "backtrack_log": {
+          "type": "array",
+          "description": "Record of all backtrack requests (including ignored/exhausted ones) for audit.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "reason": { "type": "string" },
+              "result": { "type": "string", "enum": ["triggered", "ignored", "exhausted"] },
+              "attempt": { "type": "integer" },
+              "timestamp": { "type": "string" }
+            }
+          }
         },
         "terminated": {
           "type": "boolean",

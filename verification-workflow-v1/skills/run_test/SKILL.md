@@ -103,3 +103,26 @@ Return JSON matching the output schema. This becomes the artifact file content:
 ```
 
 Do not include a top-level `passed` field — the `verdict` task will decide the overall verdict based on these results. Do not wrap in `{ data: ... }` — return content directly.
+
+
+## request_backtrack (optional)
+
+If you discover a problem in a predecessor task's output that cannot be fixed in the current task, you can request the engine to backtrack by including a `request_backtrack` field in your output:
+
+```json
+{
+  "... normal output fields ...": "...",
+  "request_backtrack": {
+    "to": "requirement_clarification",
+    "reason": "Requirement #3 contradicts the technical design, needs re-clarification"
+  }
+}
+```
+
+Rules:
+- `to` must be a predecessor task (one that runs before this task in the workflow).
+- The engine validates the target and enforces a per-task limit (`max_backtrack_per_task`, default 3).
+- If the request is ignored (invalid target, limit exceeded), the workflow continues normally — your output is still recorded.
+- Do not abuse this: only request backtrack when the predecessor output genuinely needs revision.
+
+This goes inside your output data (alongside `files`, `summary`, etc.). The engine extracts it automatically.

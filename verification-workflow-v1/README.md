@@ -200,7 +200,7 @@ verification-workflow-v1/
 | artifact | `file` | 产出无 `files` 字段（默认） |
 | side-effect | `changed_files`, `summary` | 产出含 `files` 字段（如 code task） |
 
-两种模式都可带 `passed`（可选布尔，仅 verdict task 有，驱动回环）。
+两种模式都可带 `passed`（可选布尔，仅 verdict task 有，驱动回环）和 `request_backtrack`（可选对象，大模型主动请求回头，见[request_backtrack](#request_backtrack)）。
 
 审批相关字段（仅 `requires_approval` 的 task）：`approval_status`（null/approved/rejected）、`approved_by`、`approved_at`、`reject_reason`。
 
@@ -257,9 +257,9 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
   │
   ├─ skill 执行体 → 输出 NEED_SKILL，退出
   │    Agent 读 SKILL.md → 思考 → 产出 → 调 --output '<json>'
-  │    引擎处理产出（写盘或写 artifact）→ 检查回环 → 推进
+  │    引擎处理产出 → checkLoops → checkRequestBacktrack → 推进
   │
-  ├─ script 执行体 → 引擎直接执行 → 检查回环 → 推进
+  ├─ script 执行体 → 引擎直接执行 → checkLoops → checkRequestBacktrack → 推进
   │
   └─ 无更多 task → FINISHED
 ```
@@ -287,6 +287,37 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
 ### 审批门禁
 
 `requires_approval: true` 的 task（默认只有 code）执行前暂停，输出 `NEED_APPROVAL`。用户同意才执行，拒绝则触发回环。回环重跑时重新审批。
+
+### request_backtrack
+
+大模型在执行中发现前序 task 的产出有问题（如需求矛盾、方案不可行），可以在产出里带 `request_backtrack` 字段，**请求**引擎回头重跑前序 task。
+
+```json
+{
+  "files": [...],
+  "summary": "...",
+  "request_backtrack": {
+    "to": "requirement_clarification",
+    "reason": "需求第三条与技术方案冲突"
+  }
+}
+```
+
+引擎在 `checkLoops` 之后检查 `request_backtrack`（loops 优先）。规则：
+
+- **只允许往回跳**：目标必须是当前 task 的前序。往前跳会被忽略。
+- **per-task 计数**：每个 task 发起 backtrack 的次数独立计数，上限 `max_backtrack_per_task`（默认 3）。不管回到哪，同一个 task 最多发起 3 次。
+- **超限不终止**：请求被忽略，工作流正常推进。但记录在 `backtrack_log` 里供审计。
+- **jump_to 逻辑跟 loops 一致**：清除目标之后所有 task 的 history，强制重跑。
+
+两套回溯机制独立计数，互不干扰：
+
+| 机制 | 计数器 | 键 | 上限 |
+|---|---|---|---|
+| 声明式 loops | `loop_counts` | `"trigger→target"` | 每条 loop 的 `max_iterations` |
+| request_backtrack | `backtrack_counts` | `"发起 task name"` | `max_backtrack_per_task` |
+
+引擎输出新增 `BACKTRACK`（触发）和 `BACKTRACK_IGNORED`（忽略/超限）。所有请求（含被忽略的）记录在 `context.backtrack_log` 供审计。
 
 ---
 
@@ -339,7 +370,9 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
    - NEED_APPROVAL → 问用户 → --approve 或 --reject "理由"
    - NEED_SKILL    → 读 SKILL.md → 思考 → --output '<json>'
    - DONE          → 继续 --step
-   - LOOP_BACK     → 继续 --step（引擎已移指针）
+   - LOOP_BACK     → 继续 --step（声明式回环，引擎已移指针）
+   - BACKTRACK     → 继续 --step（大模型请求回头，引擎已移指针）
+   - BACKTRACK_IGNORED → 继续 --step（请求被忽略，正常推进）
    - FINISHED      → 向用户汇报
    - FAILED/TERMINATED → 向用户汇报原因
 ```
@@ -362,6 +395,8 @@ node engine/loop.js --workflow <path> --step --output '<json>'  # 喂回产出
 | `NEED_SKILL` | task, ref, input |
 | `DONE` | task, status, output |
 | `LOOP_BACK` | from, to, iteration, max |
+| `BACKTRACK` | from, to, reason, iteration, max |
+| `BACKTRACK_IGNORED` | from, reason |
 | `FINISHED` | — |
 | `FAILED` | task, output |
 | `TERMINATED` | reason |
@@ -416,6 +451,12 @@ node engine/loop.js --workflow <path> --step --output '<json>'  # 喂回产出
 | 18 | run_test 如实报告，禁止替失败找理由 | 失败就是失败，环境问题也是失败 |
 | 19 | verdict 基于 failed_count 判定，不豁免 | 环境问题导致回环耗尽 → 终止，是正确结果 |
 | 20 | Agent 自己看仓库 | 引擎只管编排，信息收集由 Agent 用工具自主完成 |
+| 21 | request_backtrack：大模型可请求回头 | 在引擎保持控制权前提下给大模型反馈通道，既有纪律又有灵活性 |
+| 22 | checkLoops 优先于 checkRequestBacktrack | 声明式硬规则优先于大模型软请求 |
+| 23 | request_backtrack 只允许往前序跳 | 防止大模型往前跳打乱流程 |
+| 24 | per-task 计数（max_backtrack_per_task） | 每个 task 独立额度，互不干扰 |
+| 25 | backtrack 超限不终止，正常推进 | 请求被拒绝不代表 task 失败 |
+| 26 | 所有 backtrack 请求记录在 backtrack_log | 被忽略的也记录，供审计 |
 
 ---
 

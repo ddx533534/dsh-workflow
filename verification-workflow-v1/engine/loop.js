@@ -122,10 +122,15 @@ function loadWorkflow(workflowPath) {
       current_phase: null,
       current_task: null,
       loop_counts: {},
+      backtrack_counts: {},
+      backtrack_log: [],
       terminated: false,
       terminate_reason: null,
     };
   }
+  // Ensure backtrack fields exist even if context was loaded from old workflow.json
+  if (!workflow.context.backtrack_counts) workflow.context.backtrack_counts = {};
+  if (!workflow.context.backtrack_log) workflow.context.backtrack_log = [];
 
   return { workflow, workflowDir };
 }
@@ -430,6 +435,14 @@ function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelo
     output.passed = outputEnvelope.passed;
   }
 
+  // Extract request_backtrack from data if present (stays in workflow.json, not in file)
+  if (data.request_backtrack && data.request_backtrack.to) {
+    output.request_backtrack = {
+      to: data.request_backtrack.to,
+      reason: data.request_backtrack.reason || '',
+    };
+  }
+
   return output;
 }
 
@@ -563,6 +576,93 @@ function checkLoops(workflow, task) {
     }
   }
   return { triggered: false };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4b. BACKTRACK CONTROLLER — check request_backtrack from LLM output
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Check if the LLM requested a backtrack via output.request_backtrack.
+ *
+ * Rules:
+ *   - Only allowed to backtrack to a predecessor task (target must be before current).
+ *   - Per-task counting: backtrack_counts[task.name] must be < max_backtrack_per_task.
+ *   - If triggered: jump_to target (same as checkLoops — clear downstream history).
+ *   - If ignored (invalid target / not predecessor): record in backtrack_log, normal advance.
+ *   - If exhausted (per-task limit reached): record in backtrack_log, normal advance.
+ *
+ * checkLoops has priority: if checkLoops already triggered, this function is not called.
+ *
+ * @param {object} workflow
+ * @param {object} task — the task that just finished
+ * @returns {{triggered: boolean, ignored?: boolean, exhausted?: boolean, info?: object}}
+ */
+function checkRequestBacktrack(workflow, task) {
+  const hist = task.history || [];
+  const last = hist[hist.length - 1];
+  if (!last || !last.output || !last.output.request_backtrack) {
+    return { triggered: false };
+  }
+
+  const req = last.output.request_backtrack;
+  const now = new Date().toISOString();
+
+  // Helper to record in backtrack_log
+  function logBacktrack(from, to, reason, result, attempt) {
+    if (!workflow.context.backtrack_log) workflow.context.backtrack_log = [];
+    workflow.context.backtrack_log.push({ from, to, reason, result, attempt, timestamp: now });
+  }
+
+  // 1. Validate target task exists
+  const target = getTask(workflow, req.to);
+  if (!target) {
+    logBacktrack(task.name, req.to, req.reason, 'ignored', last.attempt);
+    return { triggered: false, ignored: true, reason: `unknown target: ${req.to}` };
+  }
+
+  // 2. Validate target is a predecessor (only allow backward jumps)
+  const ordered = orderTasks(workflow.tasks);
+  const currentIdx = ordered.findIndex(t => t.name === task.name);
+  const targetIdx = ordered.findIndex(t => t.name === req.to);
+  if (targetIdx >= currentIdx) {
+    logBacktrack(task.name, req.to, req.reason, 'ignored', last.attempt);
+    return { triggered: false, ignored: true, reason: `target must be before current task` };
+  }
+
+  // 3. Per-task count check
+  const maxPerTask = workflow.max_backtrack_per_task || 3;
+  const counts = workflow.context.backtrack_counts || {};
+  const current = counts[task.name] || 0;
+  if (current >= maxPerTask) {
+    logBacktrack(task.name, req.to, req.reason, 'exhausted', last.attempt);
+    return { triggered: false, exhausted: true, reason: `max_backtrack_per_task exceeded for ${task.name}` };
+  }
+
+  // 4. Count + jump_to (same logic as checkLoops)
+  counts[task.name] = current + 1;
+  workflow.context.backtrack_counts = counts;
+
+  // Clear downstream history (same as checkLoops)
+  for (let i = targetIdx + 1; i < ordered.length; i++) {
+    ordered[i].history = [];
+    ordered[i].started_at = null;
+    ordered[i].finished_at = null;
+  }
+
+  workflow.context.current_task = target.name;
+  workflow.context.current_phase = target.phase;
+
+  logBacktrack(task.name, req.to, req.reason, 'triggered', last.attempt);
+
+  return {
+    triggered: true,
+    from: task.name,
+    to: req.to,
+    reason: req.reason,
+    iteration: current + 1,
+    max: maxPerTask,
+  };
 }
 
 /**
@@ -812,6 +912,30 @@ function step(workflowPath, opts) {
       return;
     }
 
+    // Check request_backtrack (LLM-initiated, after loops didn't trigger)
+    const btResult = checkRequestBacktrack(workflow, task);
+    if (btResult.triggered) {
+      saveWorkflow(workflow, workflowPath);
+      emit({
+        type: 'BACKTRACK',
+        from: btResult.from,
+        to: btResult.to,
+        reason: btResult.reason,
+        iteration: btResult.iteration,
+        max: btResult.max,
+      });
+      return;
+    }
+    if (btResult.ignored || btResult.exhausted) {
+      saveWorkflow(workflow, workflowPath);
+      emit({
+        type: 'BACKTRACK_IGNORED',
+        from: task.name,
+        reason: btResult.reason,
+      });
+      // Continue to advance (request ignored, normal flow)
+    }
+
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
     emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
@@ -885,6 +1009,30 @@ function step(workflowPath, opts) {
       return;
     }
 
+    // Check request_backtrack (LLM-initiated, after loops didn't trigger)
+    const btResult = checkRequestBacktrack(workflow, task);
+    if (btResult.triggered) {
+      saveWorkflow(workflow, workflowPath);
+      emit({
+        type: 'BACKTRACK',
+        from: btResult.from,
+        to: btResult.to,
+        reason: btResult.reason,
+        iteration: btResult.iteration,
+        max: btResult.max,
+      });
+      return;
+    }
+    if (btResult.ignored || btResult.exhausted) {
+      saveWorkflow(workflow, workflowPath);
+      emit({
+        type: 'BACKTRACK_IGNORED',
+        from: task.name,
+        reason: btResult.reason,
+      });
+      // Continue to advance (request ignored, normal flow)
+    }
+
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
     emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
@@ -907,6 +1055,8 @@ function status(workflowPath) {
     terminated: workflow.context.terminated,
     terminate_reason: workflow.context.terminate_reason,
     loop_counts: workflow.context.loop_counts,
+    backtrack_counts: workflow.context.backtrack_counts || {},
+    backtrack_log: workflow.context.backtrack_log || [],
     task_progress: workflow.tasks.map(t => {
       const hist = t.history || [];
       const last = hist[hist.length - 1];
