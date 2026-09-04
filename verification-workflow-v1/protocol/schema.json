@@ -19,7 +19,12 @@
     },
     "artifacts_dir": {
       "type": ["string", "null"],
-      "description": "Runtime. Path to the artifacts directory, created by the engine on first execution. Format: '.verification-workflow/<run_name>_<timestamp>/artifacts'. null until first step."
+      "description": "Runtime. Path to the artifacts directory, relative to the run directory. Created by the engine on first execution. Value: 'artifacts'. null until first step."
+    },
+    "project_root": {
+      "type": "string",
+      "description": "Project root directory relative to the run directory. Used as the base path for side-effect mode file writes (code task). Default: '../..' (run directory is .verification-workflow/run_<ts>/, project root is two levels up).",
+      "default": "../.."
     },
     "phases": {
       "type": "array",

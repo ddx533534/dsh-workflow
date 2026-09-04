@@ -197,10 +197,13 @@ function findNextTask(workflow) {
 
 /**
  * Ensure artifacts_dir exists. On first execution (artifacts_dir is null),
- * create it using run_name + current timestamp.
+ * create the artifacts/ subdirectory inside the run directory.
+ *
+ * The run directory itself is created by the Agent when generating workflow.json,
+ * so the engine only needs to create the artifacts/ subdirectory.
  *
  * @param {object} workflow
- * @param {string} workflowDir — directory containing workflow.json
+ * @param {string} workflowDir — the run directory (where .workflow.json lives)
  * @returns {string} — the artifacts_dir path (relative to workflowDir)
  */
 function ensureArtifactsDir(workflow, workflowDir) {
@@ -212,9 +215,8 @@ function ensureArtifactsDir(workflow, workflowDir) {
     return workflow.artifacts_dir;
   }
 
-  // First execution: create the directory
-  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14); // YYYYMMDDHHmmss
-  const relDir = `.verification-workflow/${workflow.run_name}_${ts}/artifacts`;
+  // First execution: create artifacts/ subdirectory inside the run directory
+  const relDir = 'artifacts';
   const absDir = path.resolve(workflowDir, relDir);
   fs.mkdirSync(absDir, { recursive: true });
   workflow.artifacts_dir = relDir;
@@ -411,11 +413,12 @@ function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelo
   const summary = data.summary || (outputEnvelope && outputEnvelope.summary);
 
   if (files && files.length > 0) {
-    // Side-effect mode: write files to the real repo
+    // Side-effect mode: write files to the real repo (project_root), not the run directory
+    const projectRoot = workflow.project_root || '../..';
     const changedFiles = [];
     for (const f of files) {
       if (f.path && typeof f.content === 'string') {
-        const absPath = path.resolve(workflowDir, f.path);
+        const absPath = path.resolve(workflowDir, projectRoot, f.path);
         fs.mkdirSync(path.dirname(absPath), { recursive: true });
         fs.writeFileSync(absPath, f.content, 'utf8');
         changedFiles.push(f.path);

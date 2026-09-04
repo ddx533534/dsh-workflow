@@ -115,10 +115,20 @@ verification-workflow-v1/
 
 ```
 <项目根>/
-├── workflow.json               # 声明 + 运行时状态
 └── .verification-workflow/
-    └── <run_name>_<时间戳>/artifacts/   # 产出文件
+    └── run_<时间戳>/              # 一次完整运行的根目录（Agent 生成 workflow.json 时创建）
+        ├── .workflow.json          # 声明 + 运行时状态（唯一一份，引擎读写）
+        └── artifacts/              # 产出文件（引擎首次 step 时创建）
+            ├── requirement_clarification_attempt1.json
+            ├── tech_design_attempt1.json
+            ├── code_review_attempt1.json
+            ├── run_test_attempt1.json
+            └── verdict_attempt1.json
 ```
+
+- **run 目录名**：`run_<YYYYMMDDHHmmss>`，不绑 run_name，时间戳保证唯一。
+- **project_root**：workflow.json 里的 `project_root` 字段（默认 `../..`），表示项目根相对 run 目录的路径。side-effect 模式（code task）写文件时基于此路径，写到真实仓库而非 run 目录。
+- Agent 生成 workflow.json 时直接写到 `run_<时间戳>/.workflow.json`，引擎不搬家、不同步，全程只读写这一份。
 
 ### 两层 skill
 
@@ -140,6 +150,7 @@ verification-workflow-v1/
   "version": "1.0",
   "run_name": "add_login_feature",
   "artifacts_dir": null,
+  "project_root": "../..",
   "phases": [Phase],
   "tasks": [Task],
   "loops": [Loop],
@@ -147,8 +158,9 @@ verification-workflow-v1/
 }
 ```
 
-- `run_name`：英文短名，Agent 生成 workflow.json 时填，用于拼 artifacts_dir。
-- `artifacts_dir`：引擎首次执行时创建。
+- `run_name`：英文短名，Agent 生成 workflow.json 时填，语义标识用途，不用于目录名。
+- `artifacts_dir`：引擎首次执行时创建（`artifacts`，相对于 run 目录）。
+- `project_root`：项目根相对 run 目录的路径（默认 `../..`）。side-effect 模式写文件基于此路径。
 - `loops`：全局配置，可跨 phase。
 
 ### Phase
@@ -188,7 +200,7 @@ verification-workflow-v1/
   "attempt": 1,
   "status": "success",
   "output": {
-    "file": ".verification-workflow/.../artifacts/tech_design_attempt1.json"
+    "file": "artifacts/tech_design_attempt1.json"
   }
 }
 ```
@@ -326,7 +338,7 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
 引擎按产出结构自动判断模式，不需要声明字段：
 
 **产出含 `files` 数组 → side-effect 模式：**
-- 引擎把每个 file 的 content 写进真实仓库
+- 引擎把每个 file 的 content 写进真实仓库（路径基准 `project_root`，即项目根）
 - output 只存 `changed_files`（路径列表）+ `summary`
 - 不创建 artifact 文件
 - 下一个 task 通过 `changed_files` 知道改了哪些文件，用 `read` 工具从真实仓库读
@@ -365,8 +377,12 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
 ### Agent 驱动循环
 
 ```
-1. 加载 skill → 生成 workflow.json（填 run_name）
-2. 循环调 node engine/loop.js --step，按输出类型处理:
+1. 加载 skill → 生成 workflow.json：
+   a. 生成时间戳 ts = YYYYMMDDHHmmss
+   b. 创建 run 目录 .verification-workflow/run_<ts>/
+   c. 基于 templates/workflow_template.json 填写声明（run_name、project_root 等）
+   d. 写到 .verification-workflow/run_<ts>/.workflow.json
+2. 循环调 node engine/loop.js --workflow .verification-workflow/run_<ts>/.workflow.json --step，按输出类型处理:
    - NEED_APPROVAL → 问用户 → --approve 或 --reject "理由"
    - NEED_SKILL    → 读 SKILL.md → 思考 → --output '<json>'
    - DONE          → 继续 --step

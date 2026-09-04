@@ -2,6 +2,7 @@
   "version": "1.0",
   "run_name": "default_workflow",
   "artifacts_dir": null,
+  "project_root": "../..",
   "max_backtrack_per_task": 3,
   "phases": [
     {

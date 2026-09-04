@@ -18,7 +18,7 @@ This skill provides a protocol-driven workflow for plan → code → verify loop
 ## How to use
 
 1. The user triggers this skill with `/verification-workflow <requirement>`.
-2. The Agent generates a `workflow.json` based on the user's requirement, using `templates/workflow_template.json` as the starting point.
+2. The Agent generates a `workflow.json` based on the user's requirement, using `templates/workflow_template.json` as the starting point. The Agent creates a run directory `.verification-workflow/run_<YYYYMMDDHHmmss>/` and writes the workflow to `.verification-workflow/run_<ts>/.workflow.json`.
 3. The Agent drives execution by repeatedly calling `node engine/loop.js --step`:
    - For `handler.type == "script"`: the engine executes the script directly.
    - For `handler.type == "skill"`: the engine outputs `NEED_SKILL: <ref>, INPUT: <json>` and exits. The Agent reads the sub-skill's `SKILL.md` at `<ref>/SKILL.md`, thinks per its prompt, produces output, then feeds it back via `node engine/loop.js --step --output "<json>"`.
@@ -29,7 +29,7 @@ This skill provides a protocol-driven workflow for plan → code → verify loop
 
 See `protocol/schema.json` for the full definition. Core structure:
 
-- **Workflow** — root: `{ version, phases[], tasks[], loops[], context }`
+- **Workflow** — root: `{ version, run_name, artifacts_dir?, project_root?, phases[], tasks[], loops[], context }`
 - **Phase** — major stage: `{ name, tasks[] }`
 - **Task** — concrete task: `{ name, phase, handler{type,ref}, depends_on?, input?, output?, started_at, finished_at, history[] }`
 - **Attempt** — execution record: `{ attempt, status:"success"|"fail", output:{data, passed?} }`
