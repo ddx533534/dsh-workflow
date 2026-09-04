@@ -124,6 +124,7 @@ function loadWorkflow(workflowPath) {
       loop_counts: {},
       backtrack_counts: {},
       backtrack_log: [],
+      known_agents: [],
       terminated: false,
       terminate_reason: null,
     };
@@ -131,6 +132,8 @@ function loadWorkflow(workflowPath) {
   // Ensure backtrack fields exist even if context was loaded from old workflow.json
   if (!workflow.context.backtrack_counts) workflow.context.backtrack_counts = {};
   if (!workflow.context.backtrack_log) workflow.context.backtrack_log = [];
+  // Ensure known_agents exists for executor tracking
+  if (!workflow.context.known_agents) workflow.context.known_agents = [];
 
   return { workflow, workflowDir };
 }
@@ -269,18 +272,45 @@ function readArtifact(workflowDir, relFilePath) {
 /**
  * Execute a task's handler.
  * - skill: do NOT execute here; return a NEED_SKILL directive for the Agent.
+ *   If the task has an `executor` field (e.g. "subagent:coder"), the directive
+ *   includes executor info (agent_id, reuse) so the Agent knows whether to
+ *   create a new sub-agent or send_message to an existing one.
  * - script: run via bash, read JSON output from stdout.
  *
  * @param {object} task
  * @param {object} input  — assembled input data
  * @param {string} skillRoot — path to the verification-workflow skill root
- * @returns {{kind:'skill', ref:string, input:object} | {kind:'script', output:object, failed?:boolean}}
+ * @param {object} workflow — the workflow object (for known_agents tracking)
+ * @returns {{kind:'skill', ref:string, input:object, executor?:object} | {kind:'script', output:object, failed?:boolean}}
  */
-function executeHandler(task, input, skillRoot) {
+function executeHandler(task, input, skillRoot, workflow) {
   const handler = task.handler;
 
   if (handler.type === 'skill') {
-    return { kind: 'skill', ref: handler.ref, input };
+    const executorDecl = task.executor || 'self';
+    if (executorDecl === 'self') {
+      // Main Agent executes directly (current behavior)
+      return { kind: 'skill', ref: handler.ref, input };
+    }
+    if (executorDecl.startsWith('subagent:')) {
+      const agentId = executorDecl.slice('subagent:'.length);
+      const knownAgents = workflow.context.known_agents || [];
+      const reuse = knownAgents.includes(agentId);
+      if (!reuse) {
+        // First time seeing this agent_id — record it
+        if (!workflow.context.known_agents) {
+          workflow.context.known_agents = [];
+        }
+        workflow.context.known_agents.push(agentId);
+      }
+      return {
+        kind: 'skill',
+        ref: handler.ref,
+        input,
+        executor: { mode: 'subagent', agent_id: agentId, reuse },
+      };
+    }
+    throw new Error(`Unknown executor '${executorDecl}' for task '${task.name}'`);
   }
 
   if (handler.type === 'script') {
@@ -956,14 +986,17 @@ function step(workflowPath, opts) {
     return;
   }
 
-  const result = executeHandler(task, input, skillRoot);
+  const result = executeHandler(task, input, skillRoot, workflow);
 
   if (result.kind === 'skill') {
+    // Save workflow (known_agents may have been updated by executeHandler)
+    saveWorkflow(workflow, workflowPath);
     emit({
       type: 'NEED_SKILL',
       task: task.name,
       ref: result.ref,
       input: result.input,
+      ...(result.executor ? { executor: result.executor } : {}),
     });
     return;
   }
@@ -1060,6 +1093,7 @@ function status(workflowPath) {
     loop_counts: workflow.context.loop_counts,
     backtrack_counts: workflow.context.backtrack_counts || {},
     backtrack_log: workflow.context.backtrack_log || [],
+    known_agents: workflow.context.known_agents || [],
     task_progress: workflow.tasks.map(t => {
       const hist = t.history || [];
       const last = hist[hist.length - 1];

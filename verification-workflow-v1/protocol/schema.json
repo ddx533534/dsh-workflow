@@ -103,6 +103,11 @@
           "default": false,
           "description": "If true, the engine pauses before executing this task and waits for human approval. Re-checked on every loop re-run."
         },
+        "executor": {
+          "type": "string",
+          "default": "self",
+          "description": "Who executes this task. 'self' = main Agent executes directly (default). 'subagent:<agent_id>' = a named sub-agent executes. Same agent_id across tasks shares one sub-agent instance (reused, with continuous context). Sub-agents have full tool access by default. The engine outputs executor info (agent_id, reuse) in NEED_SKILL so the Agent can create or reuse the sub-agent via subagent/send_message."
+        },
         "started_at": {
           "type": "string",
           "format": "date-time",
@@ -285,6 +290,11 @@
               "timestamp": { "type": "string" }
             }
           }
+        },
+        "known_agents": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Runtime. List of sub-agent IDs that have been created so far. Used by the engine to determine reuse vs create: if an agent_id is already in this list, the NEED_SKILL output carries reuse=true (Agent should send_message to the existing sub-agent); otherwise reuse=false (Agent should create a new sub-agent)."
         },
         "terminated": {
           "type": "boolean",

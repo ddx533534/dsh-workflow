@@ -187,6 +187,7 @@ verification-workflow-v1/
 |---|---|
 | `name` | 全局唯一，与 `phase` 联合标识。 |
 | `handler` | `{ type: "skill"\|"script", ref }`。ref 是相对路径。 |
+| `executor` | 默认 `self`（主 Agent 自己执行）。`subagent:<agent_id>` = 起子 Agent 执行，同 agent_id 跨 task 复用。 |
 | `depends_on` | 前置 task 列表，声明串行顺序。 |
 | `requires_approval` | 默认 false。true = 执行前必须人工审批。 |
 | `input`/`output` | JSON Schema 契约，可选。子 skill 可自声明。 |
@@ -384,7 +385,11 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
    d. 写到 .verification-workflow/run_<ts>/.workflow.json
 2. 循环调 node engine/loop.js --workflow .verification-workflow/run_<ts>/.workflow.json --step，按输出类型处理:
    - NEED_APPROVAL → 问用户 → --approve 或 --reject "理由"
-   - NEED_SKILL    → 读 SKILL.md → 思考 → --output '<json>'
+   - NEED_SKILL    → 看 executor 字段：
+     - 无 executor（= self）→ 读 SKILL.md → 思考 → --output '<json>'
+     - executor.reuse == false → subagent 起新子 Agent（prompt 指向 SKILL.md，传 input）→ 收产出 → --output '<json>'
+     - executor.reuse == true  → send_message 给已有子 Agent（传新 input）→ 收产出 → --output '<json>'
+     - 主 Agent 不加工产出，直传
    - DONE          → 继续 --step
    - LOOP_BACK     → 继续 --step（声明式回环，引擎已移指针）
    - BACKTRACK     → 继续 --step（大模型请求回头，引擎已移指针）
@@ -392,6 +397,29 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
    - FINISHED      → 向用户汇报
    - FAILED/TERMINATED → 向用户汇报原因
 ```
+
+### 执行器机制
+
+每个 task 声明 `executor` 字段决定由谁执行：
+
+| executor | 含义 | 场景 |
+|---|---|---|
+| `self` 或不填 | 主 Agent 自己执行 | 兼容旧行为 |
+| `subagent:<agent_id>` | 起名为 `<agent_id>` 的子 Agent | 隔离上下文 |
+
+**子 Agent 复用**：同一个 `subagent:coder` 出现在多个 task 里时，共享同一个子 Agent 实例。回环重跑同一个 task 时，同一个子 Agent 继续——它记得上一轮做了什么，上下文连续。引擎在 `context.known_agents` 里记录已创建的子 Agent，`NEED_SKILL` 输出带 `executor.reuse: true/false` 告诉主 Agent 是新建还是复用。
+
+**主 Agent 的定位**：编排者 + 用户接口，不做执行。收子 Agent 产出后直传 `--output` 喂回引擎，不判断、不加工。子 Agent 的思考过程、工具调用、中间状态不进主 Agent 上下文，从而解决上下文爆炸问题。
+
+**默认 executor 分配**：
+
+| 阶段 | task | executor |
+|------|------|----------|
+| plan | requirement_clarification, tech_design, test_case_design | `subagent:planner` |
+| code | code, code_review | `subagent:coder` |
+| verify | run_test, verdict | `subagent:verifier` |
+
+3 个子 Agent，各自独立上下文，跨 task 复用。
 
 ### CLI
 
@@ -408,7 +436,7 @@ node engine/loop.js --workflow <path> --step --output '<json>'  # 喂回产出
 | type | 关键字段 |
 |---|---|
 | `NEED_APPROVAL` | task, attempt |
-| `NEED_SKILL` | task, ref, input |
+| `NEED_SKILL` | task, ref, input, executor? |
 | `DONE` | task, status, output |
 | `LOOP_BACK` | from, to, iteration, max |
 | `BACKTRACK` | from, to, reason, iteration, max |
@@ -416,7 +444,7 @@ node engine/loop.js --workflow <path> --step --output '<json>'  # 喂回产出
 | `FINISHED` | — |
 | `FAILED` | task, output |
 | `TERMINATED` | reason |
-| `STATUS` | current_task, task_progress[], loop_counts |
+| `STATUS` | current_task, task_progress[], loop_counts, known_agents |
 | `ERROR` | message |
 
 ---
