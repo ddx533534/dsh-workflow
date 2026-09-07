@@ -435,7 +435,7 @@ function validateAgainstSchema(value, schema) {
  * @param {object} outputEnvelope — { data, passed? }
  * @returns {object} — the output object to store in the Attempt
  */
-function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelope) {
+function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelope, outputFilePath) {
   const data = (outputEnvelope && outputEnvelope.data) || {};
   const output = {};
 
@@ -461,8 +461,19 @@ function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelo
     if (summary) {
       output.summary = summary;
     }
+  } else if (outputFilePath) {
+    // Artifact mode: sub-agent already wrote the file directly into artifacts/.
+    // Engine just records the path — does NOT read content, NOT re-write.
+    // Convert absolute path to relative (if under workflowDir) for portability.
+    const absOutput = path.resolve(outputFilePath);
+    const absWorkflow = path.resolve(workflowDir);
+    if (absOutput.startsWith(absWorkflow + path.sep)) {
+      output.file = path.relative(absWorkflow, absOutput);
+    } else {
+      output.file = outputFilePath;
+    }
   } else {
-    // Default mode: externalize to artifact file
+    // Fallback: no output file path provided, externalize to artifact file
     output.file = writeArtifact(workflow, workflowDir, taskName, attemptNum, data);
   }
 
@@ -494,14 +505,14 @@ function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelo
  * @param {object|null} approval — { approval_status, approved_by, approved_at, reject_reason } or null
  * @returns {object} — the written Attempt
  */
-function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, approval) {
+function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, approval, outputFilePath) {
   if (!task.history) task.history = [];
   const attemptNum = task.history.length + 1;
   const now = new Date().toISOString();
   if (!task.started_at) task.started_at = now;
   task.finished_at = now;
 
-  const output = processOutput(workflow, workflowDir, task.name, attemptNum, outputEnvelope);
+  const output = processOutput(workflow, workflowDir, task.name, attemptNum, outputEnvelope, outputFilePath);
 
   const attempt = {
     attempt: attemptNum,
@@ -922,12 +933,12 @@ function step(workflowPath, opts) {
       // Fill in the approved pending attempt with execution result
       attempt = lastAttempt;
       attempt.status = 'success';
-      attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, outputEnvelope);
+      attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, outputEnvelope, outputFilePath);
       const now = new Date().toISOString();
       task.finished_at = now;
     } else {
       // Normal task: record a fresh attempt
-      attempt = recordAttempt(workflow, workflowDir, task, 'success', outputEnvelope, null);
+      attempt = recordAttempt(workflow, workflowDir, task, 'success', outputEnvelope, null, outputFilePath);
     }
 
     saveWorkflow(workflow, workflowPath);

@@ -351,12 +351,24 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
 - 下一个 task 通过 `changed_files` 知道改了哪些文件，用 `read` 工具从真实仓库读
 
 **产出无 `files` → artifact 模式：**
-- 引擎把产出数据外置到 `artifacts/<task>_attempt<N>.json`
-- output 只存 `file` 路径
-- 回环重跑时 N 递增，不覆盖
+- 子 Agent 直接把产出写到 `artifacts/<task_name>.json`
+- 主 Agent 把该路径传给 `--output-file`
+- 引擎只记录路径到 Attempt（`output.file`），**不读内容、不解析、不重写**
 - 下一个 task 的 input 收到 `{ file: "artifacts/xxx.json" }`（路径），子 Agent 自己 `read` 内容
 
-**产出格式自动包装：** 子 Agent 产出可以是裸 JSON（如 `{"clarified_requirement": "..."}`），引擎读进来如果没有 `data` 字段会自动包装成 `{ data: { clarified_requirement: "..." } }`。不需要主 Agent 手动包装。
+**产物文件规范：每个 task 只有一个 artifact 文件**——由子 Agent 直接写入 `artifacts/<task_name>.json`，引擎不复制、不重写。主 Agent 不手动包装 `{data:...}`、不写中间文件。
+
+```
+artifacts/
+├── requirement_clarification.json    ← 子 Agent 写的，引擎直接用这个路径
+├── tech_design.json
+├── test_case_design.json
+├── code_review.json
+├── run_test.json
+└── verdict.json
+```
+
+回环重跑时，子 Agent 覆盖同名文件（或加 `_attempt2` 后缀，由子 Agent 决定）。
 
 `passed`（仅 verdict task）始终留在 workflow.json，两种模式都可带，loop_controller 直接读。
 
@@ -412,15 +424,17 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
            description = declared_name
          )
          agent_id_map[declared_name] = result.agent_id    # 存真实 id
-         output = result.output
+         output_file = result.output_file                 # 子 Agent 写到 /tmp/ 下的临时文件
        else:                                        # 映射表里有 → 复用
          real_id = agent_id_map[declared_name]
-         output = send_message(
+         result = send_message(
            agent_id = real_id,
            message  = task_prompt                   # 同样传路径，不自己读
          )
-       # 子 Agent 把产出写到文件，主 Agent 只传文件路径（不碰产出内容）
-       --output-file '<产出文件路径>' --agent-id '<real_id>'
+         output_file = result.output_file
+       # 子 Agent 直接把产出写到 artifacts/<task_name>.json
+       # 主 Agent 只传这个路径给引擎，引擎只记路径、不读内容、不重写
+       --output-file '<output_file>' --agent-id '<real_id>'
    - DONE          → 继续 --step
    - LOOP_BACK     → 继续 --step（声明式回环，引擎已移指针）
    - BACKTRACK     → 继续 --step（大模型请求回头，引擎已移指针）
