@@ -6,25 +6,25 @@
 
 ## 基本原理：为什么流程能被保证
 
-**引擎独占状态和转移条件，大模型不持有状态、不知道流程。**
+**引擎独占状态和转移条件，执行体不持有流程状态、不知道流程。**
 
-这是整套设计的核心——保证流程执行的，不是大模型的"自觉"，而是引擎对状态和转移条件的独占控制。
+这是整套设计的核心——保证流程执行的，不是执行体的"自觉"，而是引擎对状态和转移条件的独占控制。
 
 ### 三个原理
 
-**原理 1：状态独占。** 引擎把所有流程状态锁在 `workflow.json` 里——当前在第几个 task、回环了几次、每个 task 的历史产出。大模型每次被调用时只收到 input（前序 task 的产出），它不知道自己在第几轮、不知道之前跑了什么、不知道接下来要跑什么。**大模型不持有状态 → 它无法自己决定"接下来干什么"。**
+**原理 1：状态独占。** 引擎把所有流程状态锁在 `workflow.json` 里——当前在第几个 task、回环了几次、每个 task 的历史产出。执行体（大模型 / 子 Agent）每次被调用时只收到 input（前序 task 的产出路径），它不知道自己在第几轮、不知道接下来要跑什么。子 Agent 虽然有持久 Session（跨 task 复用时上下文保留），但**流程状态不在它手里**——它在哪个 task 被 call、拿到什么 input、产出存到哪，全由引擎决定。**执行体不持有流程状态 → 它无法自己决定"接下来干什么"。**
 
-**原理 2：转移条件是代码。** "什么时候从 A 到 B"写死在引擎代码里（`findNextTask`、`checkLoops`、`advance`），不写在 prompt 里。大模型被调用时，它已经在引擎选定的 task 里了——它没有机会选择"我要跑哪个 task"。
+**原理 2：转移条件是代码。** "什么时候从 A 到 B"写死在引擎代码里（`findNextTask`、`checkLoops`、`advance`），不写在 prompt 里。执行体被调用时，它已经在引擎选定的 task 里了——它没有机会选择"我要跑哪个 task"。
 
-**原理 3：单步执行。** 引擎每次 `--step` 只跑一个 task，跑完写盘退出。大模型在两次调用之间不存在——"上一步做了什么、下一步做什么"的记忆完全由 `workflow.json` 持有。
+**原理 3：单步执行。** 引擎每次 `--step` 只跑一个 task，跑完写盘退出。两次 `--step` 之间的流程状态完全由 `workflow.json` 持有。子 Agent 的持久 Session 是**业务上下文**的延续（同一个 planner 连续做 3 个 plan task 时记住前面想过的东西），不是**流程状态**的延续——它不知道引擎下一步会调谁。
 
 ### 结果
 
-大模型唯一能做的事：**收到 input → 思考 → 产出 output**。除此之外的一切——选 task、传 input、存 output、判回环、计数、终止——全是引擎代码。
+执行体唯一能做的事：**收到 input → 思考 → 产出 output**。除此之外的一切——选 task、传 input、存 output、判回环、计数、终止——全是引擎代码。
 
-大模型可以产出烂代码、可以判错 verdict，但它**不能偏离流程**——因为流程不在它手里。
+执行体可以产出烂代码、可以判错 verdict，但它**不能偏离流程**——因为流程不在它手里。
 
-**引擎是导演，大模型是演员。** 导演喊"这场戏你演 code，给你这些材料，演完把结果给我"。演员演完就下场，下一场演什么、谁来演，演员说了不算。
+**引擎是导演，执行体是演员。** 导演喊"这场戏你演 code，给你这些材料，演完把结果给我"。演员演完，下一场演什么、谁来演，演员说了算不了——但同一个演员可以连演几场戏（子 Agent 复用），他记得前面演过什么，只是不知道接下来导演会不会再喊他。
 
 ---
 
@@ -48,7 +48,7 @@
 
 ### 核心区别
 
-**本设计**：引擎独占状态和流程，大模型只管"收 input → 思考 → 产 output"。
+**本设计**：引擎独占流程状态，执行体（大模型 / 子 Agent）只管"收 input → 思考 → 产 output"。同阶段的多个 task 可复用同一个子 Agent 保持业务上下文，但流程状态始终在引擎手里。
 
 **全权交给大模型**：大模型自己持有状态、自己决定流程、自己控制每一步。
 
@@ -56,7 +56,8 @@
 
 ### 本设计的优点
 
-- **流程不偏离**：引擎强制 task 顺序、回环、审批，大模型无法跳步或忘循环。
+- **流程不偏离**：引擎强制 task 顺序、回环、审批，执行体无法跳步或忘循环。
+- **同阶段上下文连续**：同阶段的 task 复用同一个子 Agent，planner 做 3 个 plan task 时记住前面的思考，不重复读。
 - **可审计**：workflow.json 每步有记录，产出有 artifact 文件。
 - **可恢复**：崩溃了从 workflow.json 续跑，不丢进度。
 - **可复现**：流程结构固定，同样的声明跑同样的流程。
@@ -64,8 +65,7 @@
 ### 本设计的缺点
 
 - **流程是死的**：预定义的 loops 覆盖不了运行时发现的新问题（如 code 发现需求矛盾想回头改需求，但没声明这条回环，todo待解决）。
-- **task 不能协作**：每个 task 独立单轮调用，不能回头问前序 task(todo待解决)。
-- **上下文不连续**：每个 task 是独立调用，前一个的思考过程不传给后一个。
+- **跨阶段上下文断裂**：同阶段内的 task（如 plan 阶段 3 个 task）通过子 Agent 复用实现了上下文连续，但跨阶段切换时（planner → coder → verifier）上下文不传递，每个阶段的子 Agent 不知道其他阶段想过什么。
 - **简单任务过度工程**：改个 label 跑八个 task，开销远大于任务本身。
 - **声明本身可能错**：workflow.json 的 depends_on、handler.ref、loops 写错了流程就乱。
 
@@ -76,7 +76,7 @@
 
 ### 理想方向
 
-不是二选一，而是**在引擎保持控制权的前提下，给大模型一条反馈通道**——比如 task 产出里带 `request_backtrack`，大模型可以"请求"回头，引擎决定要不要执行。既有纪律，又有灵活性。（已记入 [TODO](TODO.md) 第 4 条）
+不是二选一，而是**在引擎保持控制权的前提下，给执行体一条反馈通道**——比如 task 产出里带 `request_backtrack`，执行体可以"请求"回头，引擎决定要不要执行。既有纪律，又有灵活性。（已记入 [TODO](TODO.md) 第 4 条）
 
 ---
 
@@ -118,12 +118,13 @@ verification-workflow-v1/
 └── .verification-workflow/
     └── run_<时间戳>/              # 一次完整运行的根目录（Agent 生成 workflow.json 时创建）
         ├── .workflow.json          # 声明 + 运行时状态（唯一一份，引擎读写）
-        └── artifacts/              # 产出文件（引擎首次 step 时创建）
-            ├── requirement_clarification_attempt1.json
-            ├── tech_design_attempt1.json
-            ├── code_review_attempt1.json
-            ├── run_test_attempt1.json
-            └── verdict_attempt1.json
+        └── artifacts/              # 产出文件（子 Agent 直接写入，引擎只记路径）
+            ├── requirement_clarification.json
+            ├── tech_design.json
+            ├── test_case_design.json
+            ├── code_review.json
+            ├── run_test.json
+            └── verdict.json
 ```
 
 - **run 目录名**：`run_<YYYYMMDDHHmmss>`，不绑 run_name，时间戳保证唯一。
@@ -135,7 +136,7 @@ verification-workflow-v1/
 | 层次 | 是什么 | harness 识别？ |
 |---|---|---|
 | 顶层 skill | 用户 `/verification-workflow` 触发。提供协议、引擎、模板、子 skill。 | 是 |
-| 子 skill | 被 task handler 引用的 prompt 包。自包含 input/output schema。 | 否——Agent 用 `read` 加载 |
+| 子 skill | 被 task handler 引用的 prompt 包。自包含 input/output schema。 | 否——子 Agent 自己 `read` 加载，主 Agent 不读 |
 
 ---
 
@@ -217,7 +218,7 @@ verification-workflow-v1/
 
 **产出包装自动化。** 子 Agent 写到 `--output-file` 的 JSON 可以是裸格式（如 `{"clarified_requirement": "..."}`），无需手动包 `{data: ...}`。引擎读进来如果没有 `data` 字段，自动把整个对象包进 `data`。
 
-两种模式都可带 `passed`（可选布尔，仅 verdict task 有，驱动回环）和 `request_backtrack`（可选对象，大模型主动请求回头，见[request_backtrack](#request_backtrack)）。
+两种模式都可带 `passed`（可选布尔，仅 verdict task 有，驱动回环）和 `request_backtrack`（可选对象，执行体主动请求回头，见[request_backtrack](#request_backtrack)）。
 
 审批相关字段（仅 `requires_approval` 的 task）：`approval_status`（null/approved/rejected）、`approved_by`、`approved_at`、`reject_reason`。
 
@@ -260,21 +261,25 @@ verification-workflow-v1/
 
 引擎每次 `--step` 只跑一个 task，跑完写盘退出。Agent 通过反复调 `--step` 驱动循环。
 
-这确保：引擎不直接调大模型、状态每步持久化、审批可自然暂停。
+这确保：引擎不直接调执行体、状态每步持久化、审批可自然暂停。
 
 ### 单步流程
 
 ```
-Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<json>']
+Agent: node engine/loop.js --step [--approve | --reject "理由" | --output-file '<path>' --agent-id '<id>']
   │
   引擎读 workflow.json → 找到 current_task → 首次执行时创建 artifacts_dir
   │
   ├─ requires_approval 且未审批 → 输出 NEED_APPROVAL，退出
   │    Agent 问用户 → 同意: --approve / 拒绝: --reject "理由"
   │
-  ├─ skill 执行体 → 输出 NEED_SKILL，退出
-  │    Agent 读 SKILL.md → 思考 → 产出 → 调 --output '<json>'
-  │    引擎处理产出 → checkLoops → checkRequestBacktrack → 推进
+  ├─ skill 执行体 → 输出 NEED_SKILL（带 ref 路径 + executor 信息），退出
+  │    Agent 看 executor 字段：
+  │      无 executor（= self）→ Agent 自己读 SKILL.md → 思考 → 产出
+  │      有 executor → Agent 调 subagent/send_message，把 ref 路径传给子 Agent
+  │        → 子 Agent 自己读 SKILL.md → 思考 → 直接写 artifacts/<task>.json
+  │        → Agent 拿到文件路径 → 调 --output-file '<path>' --agent-id '<id>'
+  │    引擎记录路径 → checkLoops → checkRequestBacktrack → 推进
   │
   ├─ script 执行体 → 引擎直接执行 → checkLoops → checkRequestBacktrack → 推进
   │
@@ -309,7 +314,7 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
 
 ### request_backtrack
 
-大模型在执行中发现前序 task 的产出有问题（如需求矛盾、方案不可行），可以在产出里带 `request_backtrack` 字段，**请求**引擎回头重跑前序 task。
+执行体在执行中发现前序 task 的产出有问题（如需求矛盾、方案不可行），可以在产出里带 `request_backtrack` 字段，**请求**引擎回头重跑前序 task。
 
 ```json
 {
@@ -342,19 +347,21 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
 
 ## 产出处理
 
-引擎按产出结构自动判断模式，不需要声明字段：
+引擎按产出内容自动判断模式，不需要声明字段：
 
-**产出含 `files` 数组 → side-effect 模式：**
-- 引擎把每个 file 的 content 写进真实仓库（路径基准 `project_root`，即项目根）
-- output 只存 `changed_files`（路径列表）+ `summary`
-- 不创建 artifact 文件
+**产出含 `changed_files` 数组 → 直接写仓库模式：**
+- 子 Agent 自己用工具把代码文件写进真实仓库（write/edit/bash）
+- 产出 JSON 里只有 `changed_files`（路径列表）+ `summary`，**不含文件内容**
+- 引擎只记录路径列表到 Attempt，不碰文件内容
 - 下一个 task 通过 `changed_files` 知道改了哪些文件，用 `read` 工具从真实仓库读
+- 典型 task：code
 
-**产出无 `files` → artifact 模式：**
+**产出无 `changed_files` → artifact 模式：**
 - 子 Agent 直接把产出写到 `artifacts/<task_name>.json`
 - 主 Agent 把该路径传给 `--output-file`
 - 引擎只记录路径到 Attempt（`output.file`），**不读内容、不解析、不重写**
 - 下一个 task 的 input 收到 `{ file: "artifacts/xxx.json" }`（路径），子 Agent 自己 `read` 内容
+- 典型 task：requirement_clarification, tech_design, test_case_design, code_review, run_test, verdict
 
 **产物文件规范：每个 task 只有一个 artifact 文件**——由子 Agent 直接写入 `artifacts/<task_name>.json`，引擎不复制、不重写。主 Agent 不手动包装 `{data:...}`、不写中间文件。
 
@@ -437,7 +444,7 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
        --output-file '<output_file>' --agent-id '<real_id>'
    - DONE          → 继续 --step
    - LOOP_BACK     → 继续 --step（声明式回环，引擎已移指针）
-   - BACKTRACK     → 继续 --step（大模型请求回头，引擎已移指针）
+   - BACKTRACK     → 继续 --step（执行体请求回头，引擎已移指针）
    - BACKTRACK_IGNORED → 继续 --step（请求被忽略，正常推进）
    - FINISHED      → 向用户汇报
    - FAILED/TERMINATED → 向用户汇报原因
@@ -535,17 +542,242 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 
 ## 子 Skill
 
-每个子 skill 自包含 input/output schema + prompt。output schema 描述产出内容结构，Agent 返回内容，引擎负责包装。
+每个子 skill 自包含 input/output schema + prompt。子 Agent 读取 SKILL.md 后按其指引执行，直接把产出写到 `artifacts/<task_name>.json`，引擎只记录路径——不读内容、不解析、不重写。
 
 | 子 skill | 阶段 | 审批 | 产出模式 | passed | 说明 |
 |---|---|---|---|---|---|
 | requirement_clarification | plan | 否 | artifact | 否 | 澄清需求 |
 | tech_design | plan | 否 | artifact | 否 | 设计技术方案 |
 | test_case_design | plan | 否 | artifact | 否 | 设计测试用例 |
-| code | code | **是** | **side-effect** | 否 | 产出 files → 引擎写进真实仓库 |
+| code | code | **是** | **直接写仓库** | 否 | 子 Agent 用工具写文件到真实仓库，产出只声明 changed_files |
 | code_review | code | 否 | artifact | 否 | 从真实仓库读文件来 review |
 | run_test | verify | 否 | artifact | 否 | 执行测试，如实报告 pass/fail |
 | verdict | verify | 否 | artifact | **是** | 基于 failed_count 判定 passed，驱动回环 |
+
+### 各阶段输入输出详解
+
+引擎的 `gatherInput` 根据 task 的 `depends_on` 列表，从前驱 task 的最近成功 Attempt 中收集 input。收集规则：
+- 前驱是 artifact 模式 → 传 `{ file: "artifacts/xxx.json" }`（**路径，不读内容**），子 Agent 自己 `read` 文件
+- 前驱是 side-effect 模式 → 传 `{ changed_files, summary }`（文件已在真实仓库，子 Agent 自己用工具读）
+- 前驱无产出（`null`）→ 该依赖 key 值为 `null`
+
+下面按流程顺序列出每个 task 的实际输入输出。
+
+---
+
+#### 1. requirement_clarification（plan 阶段，planner 子 Agent）
+
+**输入**（引擎 `gatherInput` 产出）：
+```json
+{}
+```
+无 `depends_on`，input 为空对象。但主 Agent 在创建 workflow.json 时会把用户原始需求写入 context 或在 task prompt 里传递。子 Agent 通过 NEED_SKILL 的 input 字段拿到。
+
+实际主 Agent 传给子 Agent 的 prompt 里包含：
+```json
+{
+  "raw_requirement": "用户输入的原始需求文本"
+}
+```
+这个 `raw_requirement` 不来自 `depends_on` 前驱，而是来自用户输入——主 Agent 在构建 workflow 时通过其他方式（如 context 自定义字段或 prompt 拼接）传递。
+
+**输出**（子 Agent 写到 `artifacts/requirement_clarification.json`）：
+```json
+{
+  "clarified_requirement": "澄清后的需求描述（string，必填）",
+  "assumptions": ["假设1", "假设2"],
+  "open_questions": ["需要用户确认的问题"]
+}
+```
+引擎存到 Attempt：`output.file = "artifacts/requirement_clarification.json"`
+
+---
+
+#### 2. tech_design（plan 阶段，planner 子 Agent 复用）
+
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["requirement_clarification"]`）：
+```json
+{
+  "requirement_clarification": {
+    "file": "artifacts/requirement_clarification.json"
+  }
+}
+```
+子 Agent 拿到路径后自己 `read` 文件，拿到 `{ clarified_requirement, assumptions, open_questions }`。
+
+**输出**（子 Agent 写到 `artifacts/tech_design.json`）：
+```json
+{
+  "tech_design": "技术设计文档：架构、组件、数据流、关键决策（string，必填）",
+  "key_components": ["模块1", "模块2"],
+  "tech_risks": ["风险1", "风险2"]
+}
+```
+引擎存到 Attempt：`output.file = "artifacts/tech_design.json"`
+
+---
+
+#### 3. test_case_design（plan 阶段，planner 子 Agent 复用）
+
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["tech_design"]`）：
+```json
+{
+  "tech_design": {
+    "file": "artifacts/tech_design.json"
+  }
+}
+```
+子 Agent 拿到路径后自己 `read`，拿到 `{ tech_design, key_components, tech_risks }`。
+
+**输出**（子 Agent 写到 `artifacts/test_case_design.json`）：
+```json
+{
+  "test_cases": [
+    {
+      "name": "测试用例名称（string，必填）",
+      "description": "用例描述（string，必填）",
+      "input": "测试输入（任意结构）",
+      "expected": "预期结果（任意结构，必填）"
+    }
+  ],
+  "coverage_notes": "覆盖说明：测了什么、没测什么"
+}
+```
+引擎存到 Attempt：`output.file = "artifacts/test_case_design.json"`
+
+---
+
+#### 4. code（code 阶段，coder 子 Agent，**需审批**）
+
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["test_case_design"]`）：
+```json
+{
+  "test_case_design": {
+    "file": "artifacts/test_case_design.json"
+  }
+}
+```
+> 注意：code 的 SKILL.md 声明 `required: [tech_design, test_case_design]`，但 workflow_template 的 `depends_on` 只有 `["test_case_design"]`。tech_design 的内容可以通过 test_case_design 间接获取（test_case_design 的 input 里有 tech_design）。如需直接引用，应在 workflow.json 的 `depends_on` 里加 `"tech_design"`。
+
+**输出**（**直接写仓库模式**，子 Agent 自己用工具写文件到真实仓库，产出 JSON 里只有路径列表）：
+```json
+{
+  "changed_files": ["src/main.py", "src/utils.py"],
+  "summary": "实现了 XX 模块，处理了 YY 逻辑"
+}
+```
+子 Agent 用自己的工具（write/edit/bash）把代码文件直接写到真实仓库。产出 JSON 里**不含文件内容**——只有路径列表和摘要。引擎只记录路径到 Attempt，不碰文件内容。不创建 artifact 文件（除非子 Agent 同时写了 `artifacts/code.json`）。
+
+**审批**：`requires_approval: true`。引擎先输出 `NEED_APPROVAL`，主 Agent 问用户，用户批准后引擎才调 code skill。用户拒绝 → 触发回环到 tech_design。
+
+---
+
+#### 5. code_review（code 阶段，coder 子 Agent 复用）
+
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["code"]`）：
+```json
+{
+  "code": {
+    "changed_files": ["src/main.py", "src/utils.py"],
+    "summary": "实现了 XX 模块，处理了 YY 逻辑"
+  }
+}
+```
+注意：这里传的是 `changed_files`（路径列表）和 `summary`，**不是文件内容**。子 Agent 拿到路径后自己用工具从真实仓库 `read` 文件内容来 review。
+
+> code_review 的 SKILL.md 还声明了 `tech_design` input（用于检查设计对齐），但 workflow_template 的 `depends_on` 只有 `["code"]`。如需 tech_design，应在 `depends_on` 里加 `"tech_design"`。
+
+**输出**（子 Agent 写到 `artifacts/code_review.json`）：
+```json
+{
+  "review_summary": "整体 review 结论（string）",
+  "issues": [
+    {
+      "severity": "blocker | major | minor | nit",
+      "file": "src/main.py",
+      "description": "问题描述"
+    }
+  ]
+}
+```
+引擎存到 Attempt：`output.file = "artifacts/code_review.json"`
+
+---
+
+#### 6. run_test（verify 阶段，verifier 子 Agent）
+
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["code_review"]`）：
+```json
+{
+  "code_review": {
+    "file": "artifacts/code_review.json"
+  }
+}
+```
+> run_test 的 SKILL.md 声明需要 `code`（changed_files）和 `test_case_design`，但 workflow_template 的 `depends_on` 只有 `["code_review"]`。如需 code 和 test_case_design，应在 `depends_on` 里加 `"code"` 和 `"test_case_design"`。实际使用时建议修改 `depends_on` 为 `["code", "test_case_design"]`。
+
+**输出**（子 Agent 写到 `artifacts/run_test.json`）：
+```json
+{
+  "results": [
+    {
+      "name": "测试用例名称（string，必填）",
+      "passed": true,
+      "actual": "实际结果（任意结构）",
+      "error": "失败时的错误信息"
+    }
+  ],
+  "summary": {
+    "total": 5,
+    "passed_count": 4,
+    "failed_count": 1
+  }
+}
+```
+引擎存到 Attempt：`output.file = "artifacts/run_test.json"`
+
+---
+
+#### 7. verdict（verify 阶段，verifier 子 Agent 复用）
+
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["run_test"]`）：
+```json
+{
+  "run_test": {
+    "file": "artifacts/run_test.json"
+  }
+}
+```
+子 Agent 拿到路径后自己 `read`，拿到 `{ results, summary }`。
+
+**输出**（子 Agent 写到 `artifacts/verdict.json`）：
+```json
+{
+  "verdict": "PASS 或 FAIL 的文字结论（string，必填）",
+  "failed_tests": ["失败的测试用例名称"],
+  "reason": "判定理由（string，必填）",
+  "passed": false
+}
+```
+引擎存到 Attempt：`output.file = "artifacts/verdict.json"`，且 `output.passed = false`（**passed 留在 workflow.json，不进文件**，loop_controller 直接读）。
+
+**回环驱动**：`output.passed == false` → 触发回环，`current_task` 跳回 `code`，最多 3 次。
+
+---
+
+### input 传递总结
+
+| Task | depends_on | input 内容 | 传递方式 |
+|---|---|---|---|
+| requirement_clarification | [] | `{ raw_requirement }` 来自用户 | 主 Agent 拼 prompt |
+| tech_design | [requirement_clarification] | `{ requirement_clarification: { file } }` | 路径 |
+| test_case_design | [tech_design] | `{ tech_design: { file } }` | 路径 |
+| code | [test_case_design] | `{ test_case_design: { file } }` | 路径 |
+| code_review | [code] | `{ code: { changed_files, summary } }` | 内联值 |
+| run_test | [code_review] | `{ code_review: { file } }` | 路径 |
+| verdict | [run_test] | `{ run_test: { file } }` | 路径 |
+
+> **注意**：code、code_review、run_test 的 SKILL.md 声明的 required input 比 workflow_template 的 `depends_on` 多。如果子 Agent 需要更多前驱数据，修改 workflow.json 的 `depends_on` 加上前驱 task 名即可，引擎会自动收集。
 
 ### run_test 和 verdict 的判定规则
 
@@ -559,8 +791,8 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 
 | # | 决策 | 理由 |
 |---|---|---|
-| 1 | 引擎独占状态和转移条件 | 大模型不持有状态 → 无法偏离流程 |
-| 2 | 单步执行 | 大模型在两次调用间不存在，状态靠 workflow.json 传递 |
+| 1 | 引擎独占状态和转移条件 | 执行体不持有流程状态 → 无法偏离流程 |
+| 2 | 单步执行 | 两次 `--step` 之间流程状态靠 workflow.json 传递，子 Agent 的持久 Session 只延续业务上下文 |
 | 3 | 转移条件写死在代码里 | 不靠 prompt 控制"接下来干什么" |
 | 4 | `phase` = 大阶段，`name` = 具体任务 | 分离阶段和任务 |
 | 5 | `status` 只有 success/fail | 无中间状态 |
@@ -579,9 +811,9 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 | 18 | run_test 如实报告，禁止替失败找理由 | 失败就是失败，环境问题也是失败 |
 | 19 | verdict 基于 failed_count 判定，不豁免 | 环境问题导致回环耗尽 → 终止，是正确结果 |
 | 20 | Agent 自己看仓库 | 引擎只管编排，信息收集由 Agent 用工具自主完成 |
-| 21 | request_backtrack：大模型可请求回头 | 在引擎保持控制权前提下给大模型反馈通道，既有纪律又有灵活性 |
-| 22 | checkLoops 优先于 checkRequestBacktrack | 声明式硬规则优先于大模型软请求 |
-| 23 | request_backtrack 只允许往前序跳 | 防止大模型往前跳打乱流程 |
+| 21 | request_backtrack：执行体可请求回头 | 在引擎保持控制权前提下给执行体反馈通道，既有纪律又有灵活性 |
+| 22 | checkLoops 优先于 checkRequestBacktrack | 声明式硬规则优先于执行体软请求 |
+| 23 | request_backtrack 只允许往前序跳 | 防止执行体往前跳打乱流程 |
 | 24 | per-task 计数（max_backtrack_per_task） | 每个 task 独立额度，互不干扰 |
 | 25 | backtrack 超限不终止，正常推进 | 请求被拒绝不代表 task 失败 |
 | 26 | 所有 backtrack 请求记录在 backtrack_log | 被忽略的也记录，供审计 |

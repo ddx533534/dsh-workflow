@@ -415,15 +415,15 @@ function validateAgainstSchema(value, schema) {
 }
 
 /**
- * Process a task's output: decide whether to write files to the real repo
- * (side-effect mode) or externalize to an artifact file (default mode).
+ * Process a task's output.
  *
  * Rule:
- *   - If output.data contains a `files` array → write each file to the real
- *     repo, store only { changed_files, summary } in the Attempt output.
- *     No artifact file is created.
- *   - Otherwise → externalize output.data to an artifact file, store
- *     { file } in the Attempt output.
+ *   - If output.data contains a `changed_files` array → direct-write mode:
+ *     sub-agent already wrote files to the real repo. Engine only records
+ *     the path list and summary. No artifact file needed.
+ *   - Else if outputFilePath provided → artifact mode: sub-agent already
+ *     wrote the file directly. Engine only records the path.
+ *   - Otherwise → fallback: engine writes output.data to an artifact file.
  *
  * `passed` (if present in the envelope) is always kept in the Attempt output
  * regardless of mode, so loop_controller can read it without touching files.
@@ -439,24 +439,15 @@ function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelo
   const data = (outputEnvelope && outputEnvelope.data) || {};
   const output = {};
 
-  // Check for files in data first, then at envelope top level.
-  // This handles both { data: { files: [...] } } and { files: [...] } formats.
-  const files = Array.isArray(data.files) ? data.files
-    : (Array.isArray(outputEnvelope && outputEnvelope.files) ? outputEnvelope.files : null);
+  // Extract changed_files and summary from data (sub-agent writes files directly
+  // to the real repo; engine only records the path list).
+  const changedFiles = Array.isArray(data.changed_files) ? data.changed_files
+    : (Array.isArray(outputEnvelope && outputEnvelope.changed_files) ? outputEnvelope.changed_files : null);
   const summary = data.summary || (outputEnvelope && outputEnvelope.summary);
 
-  if (files && files.length > 0) {
-    // Side-effect mode: write files to the real repo (project_root), not the run directory
-    const projectRoot = workflow.project_root || '../..';
-    const changedFiles = [];
-    for (const f of files) {
-      if (f.path && typeof f.content === 'string') {
-        const absPath = path.resolve(workflowDir, projectRoot, f.path);
-        fs.mkdirSync(path.dirname(absPath), { recursive: true });
-        fs.writeFileSync(absPath, f.content, 'utf8');
-        changedFiles.push(f.path);
-      }
-    }
+  if (changedFiles && changedFiles.length > 0) {
+    // Direct-write mode: sub-agent already wrote files to the real repo.
+    // Engine only records the path list and summary.
     output.changed_files = changedFiles;
     if (summary) {
       output.summary = summary;
