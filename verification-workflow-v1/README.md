@@ -213,6 +213,10 @@ verification-workflow-v1/
 | artifact | `file` | 产出无 `files` 字段（默认） |
 | side-effect | `changed_files`, `summary` | 产出含 `files` 字段（如 code task） |
 
+**input 传文件路径，不传内容。** 引擎的 `gatherInput` 收集前序 task 的产出时，artifact 模式只传 `{ file: "artifacts/xxx.json" }`（路径），side-effect 模式传 `{ changed_files, summary }`。主 Agent 和子 Agent 拿到路径后自己 `read` 文件内容——主 Agent 上下文里没有业务数据。
+
+**产出包装自动化。** 子 Agent 写到 `--output-file` 的 JSON 可以是裸格式（如 `{"clarified_requirement": "..."}`），无需手动包 `{data: ...}`。引擎读进来如果没有 `data` 字段，自动把整个对象包进 `data`。
+
 两种模式都可带 `passed`（可选布尔，仅 verdict task 有，驱动回环）和 `request_backtrack`（可选对象，大模型主动请求回头，见[request_backtrack](#request_backtrack)）。
 
 审批相关字段（仅 `requires_approval` 的 task）：`approval_status`（null/approved/rejected）、`approved_by`、`approved_at`、`reject_reason`。
@@ -281,8 +285,10 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
 
 引擎从 `depends_on` 前驱的最近成功 Attempt 收集 input：
 
-- 前驱是 artifact 模式 → 读 artifact 文件内容
-- 前驱是 side-effect 模式 → 传 `changed_files` + `summary`（文件已在真实仓库，后继 task 自己用工具读）
+- 前驱是 artifact 模式 → 传 `{ file: "artifacts/xxx.json" }`（**路径，不读内容**）。子 Agent 拿到路径后自己 `read` 文件。
+- 前驱是 side-effect 模式 → 传 `{ changed_files, summary }`（文件已在真实仓库，子 Agent 自己用工具读）
+
+主 Agent 上下文里只有文件路径和摘要，没有任何业务数据内容。
 
 ---
 
@@ -348,6 +354,9 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output '<js
 - 引擎把产出数据外置到 `artifacts/<task>_attempt<N>.json`
 - output 只存 `file` 路径
 - 回环重跑时 N 递增，不覆盖
+- 下一个 task 的 input 收到 `{ file: "artifacts/xxx.json" }`（路径），子 Agent 自己 `read` 内容
+
+**产出格式自动包装：** 子 Agent 产出可以是裸 JSON（如 `{"clarified_requirement": "..."}`），引擎读进来如果没有 `data` 字段会自动包装成 `{ data: { clarified_requirement: "..." } }`。不需要主 Agent 手动包装。
 
 `passed`（仅 verdict task）始终留在 workflow.json，两种模式都可带，loop_controller 直接读。
 
@@ -377,19 +386,41 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
 
 ### Agent 驱动循环
 
+**主 Agent 不碰仓库、不收集业务数据。** 它只拿到用户的一句话需求，直接套模板生成 workflow.json，不探查仓库结构、不读代码、不关心技术栈。所有业务理解、代码探查、数据收集都由子 Agent 在自己的上下文里完成。
+
 ```
-1. 加载 skill → 生成 workflow.json：
+1. 加载 skill → 生成 workflow.json（不探查仓库）：
    a. 生成时间戳 ts = YYYYMMDDHHmmss
    b. 创建 run 目录 .verification-workflow/run_<ts>/
-   c. 基于 templates/workflow_template.json 填写声明（run_name、project_root 等）
+   c. 基于 templates/workflow_template.json 套模板，只填 run_name（从用户需求提取英文短名）
    d. 写到 .verification-workflow/run_<ts>/.workflow.json
-2. 循环调 node engine/loop.js --workflow .verification-workflow/run_<ts>/.workflow.json --step，按输出类型处理:
+
+2. 初始化空映射表：agent_id_map = {}
+   # 存 declared_name → harness 真实 agent_id 的映射
+   # 例：{ "planner": "a3f7b2c1-...", "coder": "b8e2d4f3-..." }
+
+3. 循环调 node engine/loop.js --workflow .verification-workflow/run_<ts>/.workflow.json --step，按输出类型处理:
    - NEED_APPROVAL → 问用户 → --approve 或 --reject "理由"
    - NEED_SKILL    → 看 executor 字段：
      - 无 executor（= self）→ 读 SKILL.md → 思考 → --output '<json>'
-     - executor.reuse == false → subagent 起新子 Agent（prompt 指向 SKILL.md，传 input）→ 收产出 → --output '<json>'
-     - executor.reuse == true  → send_message 给已有子 Agent（传新 input）→ 收产出 → --output '<json>'
-     - 主 Agent 不加工产出，直传
+     - 有 executor            → 查 agent_id_map，决定新建还是复用（主 Agent 不读 SKILL.md）：
+       declared_name = executor.agent_id          # 来自 workflow.json 的声明名
+       task_prompt = "读 " + handler.ref + "/SKILL.md 并按其指引执行。输入：" + JSON.stringify(NEED_SKILL.input)
+       if declared_name not in agent_id_map:       # 映射表里没有 → 新建
+         result = subagent(
+           prompt = task_prompt,                    # 传路径给子 Agent，不自己读
+           description = declared_name
+         )
+         agent_id_map[declared_name] = result.agent_id    # 存真实 id
+         output = result.output
+       else:                                        # 映射表里有 → 复用
+         real_id = agent_id_map[declared_name]
+         output = send_message(
+           agent_id = real_id,
+           message  = task_prompt                   # 同样传路径，不自己读
+         )
+       # 子 Agent 把产出写到文件，主 Agent 只传文件路径（不碰产出内容）
+       --output-file '<产出文件路径>' --agent-id '<real_id>'
    - DONE          → 继续 --step
    - LOOP_BACK     → 继续 --step（声明式回环，引擎已移指针）
    - BACKTRACK     → 继续 --step（大模型请求回头，引擎已移指针）
@@ -398,6 +429,8 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
    - FAILED/TERMINATED → 向用户汇报原因
 ```
 
+> **注意**：引擎输出的 `executor.reuse` 是参考值（基于 `context.known_agents` 判断），但主 Agent 以自己的 `agent_id_map` 为真相——映射表里有就复用，没有就新建。这样即使引擎状态被重置，主 Agent 仍能正确复用已活的子 Agent。
+
 ### 执行器机制
 
 每个 task 声明 `executor` 字段决定由谁执行：
@@ -405,13 +438,42 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
 | executor | 含义 | 场景 |
 |---|---|---|
 | `self` 或不填 | 主 Agent 自己执行 | 兼容旧行为 |
-| `subagent:<agent_id>` | 起名为 `<agent_id>` 的子 Agent | 隔离上下文 |
+| `subagent:<name>` | 起名为 `<name>` 的子 Agent | 隔离上下文 |
 
-**子 Agent 复用**：同一个 `subagent:coder` 出现在多个 task 里时，共享同一个子 Agent 实例。回环重跑同一个 task 时，同一个子 Agent 继续——它记得上一轮做了什么，上下文连续。引擎在 `context.known_agents` 里记录已创建的子 Agent，`NEED_SKILL` 输出带 `executor.reuse: true/false` 告诉主 Agent 是新建还是复用。
+#### 子 Agent 复用：声明名 vs 真实 id
 
-**主 Agent 的定位**：编排者 + 用户接口，不做执行。收子 Agent 产出后直传 `--output` 喂回引擎，不判断、不加工。子 Agent 的思考过程、工具调用、中间状态不进主 Agent 上下文，从而解决上下文爆炸问题。
+复用机制涉及两种 id，必须分清：
 
-**默认 executor 分配**：
+| 类型 | 例子 | 谁管 | 何时产生 |
+|------|------|------|---------|
+| **声明名** (declared_name) | `"planner"` | 写在 workflow.json 的 `executor` 字段里，引擎输出 `NEED_SKILL` 时带这个 | 生成 workflow.json 时 |
+| **真实 id** (real_agent_id) | `"a3f7b2c1-..."` | 主 Agent 的 `agent_id_map` 里存，调 `subagent`/`send_message` 时用这个 | `subagent` 创建时 harness 返回 |
+
+**引擎只管声明名**：它从 `executor` 字段读声明名，在 `context.known_agents` 里记录见过哪些声明名，输出 `reuse: true/false`。引擎不持有也不存真实 id——那是 harness 运行时的引用，不该写进 workflow.json。
+
+**主 Agent 管真实 id**：它调 `subagent` 时拿到 harness 返回的真实 id，存在自己的 `agent_id_map`（声明名 → 真实 id）。下次 `reuse: true` 时，从映射表查真实 id，调 `send_message` 复用子 Agent。
+
+#### 子 Agent 生命周期
+
+子 Agent 跑完一轮后**不会消失**——它进入 idle 状态，Session 持久化，带着之前的上下文等着。`send_message` 给它发新任务时，新消息追加到同一个 Session，上下文连续。回环重跑同一个 task 时，同一个子 Agent 继续——它记得上一轮做了什么。
+
+#### 主 Agent 的定位
+
+> **纯流程调度器 + 用户接口。不碰仓库、不做执行、不收集业务数据。**
+
+主 Agent 不做的事：
+- **不探查仓库**：不 read 代码、不 grep、不 bash——所有业务数据收集由子 Agent 在自己上下文里完成
+- **不判断产出**：收子 Agent 产出后直传 `--output` 喂回引擎，不判断、不加工
+- **不思考业务**：不理解技术方案、不写代码、不跑测试——全交给子 Agent
+
+主 Agent 只做的事：
+- 把用户需求翻译成 workflow.json 声明（套模板，填 run_name）
+- 驱动 `--step` 循环、起/复用子 Agent
+- 审批问用户、最终结果报用户
+
+主 Agent 上下文里只有：用户需求（一句话）+ workflow.json 声明 + 引擎输出消息（含精简摘要）+ `--output` 喂回的 JSON + `agent_id_map` + 和用户的对话。**没有任何仓库内容、代码、业务数据。**
+
+#### 默认 executor 分配
 
 | 阶段 | task | executor |
 |------|------|----------|
@@ -419,7 +481,7 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
 | code | code, code_review | `subagent:coder` |
 | verify | run_test, verdict | `subagent:verifier` |
 
-3 个子 Agent，各自独立上下文，跨 task 复用。
+3 个子 Agent，各自独立上下文，跨 task 复用。回环时同一个子 Agent 带着上下文继续工作。
 
 ### CLI
 
@@ -428,8 +490,16 @@ node engine/loop.js --workflow <path> --status          # 查状态
 node engine/loop.js --workflow <path> --step            # 执行一步
 node engine/loop.js --workflow <path> --step --approve  # 审批通过
 node engine/loop.js --workflow <path> --step --reject "理由"  # 审批拒绝
-node engine/loop.js --workflow <path> --step --output '<json>'  # 喂回产出
+node engine/loop.js --workflow <path> --step --output '<json>'                    # 喂回产出（小内容）
+node engine/loop.js --workflow <path> --step --output-file '<path>'               # 喂回产出（大内容，从文件读）
+node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '<id>'  # 从文件读 + 真实 id
 ```
+
+`--output` 和 `--output-file` 二选一：
+- `--output '<json>'`：产出内容小（几行 JSON）时直接传，简单但受命令行长度限制
+- `--output-file '<path>'`：产出内容大时，子 Agent 把产出写到文件，主 Agent 只传文件路径给引擎。**推荐统一用 `--output-file`**——主 Agent 上下文里只有文件路径，没有产出内容，上下文更干净
+
+`--agent-id` 可选。主 Agent 调 `subagent` 或 `send_message` 后，harness 返回真实子 Agent id，主 Agent 喂回产出时通过 `--agent-id` 传给引擎。引擎在 `DONE` 输出里带上这个 id，**用于日志验证复用**：连续两次 `DONE` 的 `agent_id` 相同 = 复用了同一个子 Agent。`--status` 输出里带 `duration_ms`（每步耗时），用于查看整个过程分阶段耗时。
 
 ### 引擎输出
 
@@ -437,14 +507,14 @@ node engine/loop.js --workflow <path> --step --output '<json>'  # 喂回产出
 |---|---|
 | `NEED_APPROVAL` | task, attempt |
 | `NEED_SKILL` | task, ref, input, executor? |
-| `DONE` | task, status, output |
+| `DONE` | task, status, output, agent_id? |
 | `LOOP_BACK` | from, to, iteration, max |
 | `BACKTRACK` | from, to, reason, iteration, max |
 | `BACKTRACK_IGNORED` | from, reason |
 | `FINISHED` | — |
 | `FAILED` | task, output |
 | `TERMINATED` | reason |
-| `STATUS` | current_task, task_progress[], loop_counts, known_agents |
+| `STATUS` | current_task, task_progress[{duration_ms}], loop_counts, known_agents |
 | `ERROR` | message |
 
 ---

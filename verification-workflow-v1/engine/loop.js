@@ -354,13 +354,16 @@ function executeHandler(task, input, skillRoot, workflow) {
 /**
  * Gather input for a task from its depends_on predecessors' latest outputs.
  * Two modes:
- *   - Artifact mode (output.file): read the artifact file content.
+ *   - Artifact mode (output.file): pass the artifact file PATH (not content).
  *   - Side-effect mode (output.changed_files): pass changed_files + summary directly.
+ *
+ * Input carries file paths, not file content — the main Agent's context stays
+ * clean (no business data). The sub-agent reads the files itself.
  *
  * @param {object} workflow
  * @param {object} task
  * @param {string} workflowDir
- * @returns {object} — keyed map of predecessor name → its last output data
+ * @returns {object} — keyed map of predecessor name → { file: "<path>" } or { changed_files, summary }
  */
 function gatherInput(workflow, task, workflowDir) {
   const input = {};
@@ -370,8 +373,8 @@ function gatherInput(workflow, task, workflowDir) {
     const last = hist[hist.length - 1];
     if (last && last.status === 'success' && last.output) {
       if (last.output.file) {
-        // Artifact mode: read the artifact file
-        input[depName] = readArtifact(workflowDir, last.output.file);
+        // Artifact mode: pass the file path, NOT the content
+        input[depName] = { file: last.output.file };
       } else if (last.output.changed_files) {
         // Side-effect mode: pass changed_files + summary directly
         input[depName] = {
@@ -750,7 +753,17 @@ function saveWorkflow(workflow, workflowPath) {
  * @param {object} opts — { outputJson, approve, rejectReason }
  */
 function step(workflowPath, opts) {
-  const { outputJson, approve, rejectReason } = opts;
+  const { outputFilePath, approve, rejectReason, agentId } = opts;
+  // Resolve output: prefer --output-file (path), fall back to --output (inline JSON)
+  let outputJson = opts.outputJson;
+  if (outputFilePath) {
+    try {
+      outputJson = fs.readFileSync(outputFilePath, 'utf8');
+    } catch (e) {
+      emit({ type: 'ERROR', message: `Cannot read --output-file: ${e.message}` });
+      return;
+    }
+  }
   const { workflow, workflowDir } = loadWorkflow(workflowPath);
   const skillRoot = workflowDir;
   const ctx = workflow.context;
@@ -887,18 +900,13 @@ function step(workflowPath, opts) {
       emit({ type: 'ERROR', message: 'output must be a JSON object' });
       return;
     }
-    // Normalize: if no 'data' field but has 'files' at top level, treat the whole envelope as data.
-    // This supports both { data: { files: [...] } } and { files: [...] } formats.
+    // Normalize: if no 'data' field, wrap the whole object into data.
+    // Sub-agent output may be { clarified_requirement: "..." } without data wrapper.
+    // Also handles { files: [...] } and { passed: true, ... } formats.
     if (!('data' in outputEnvelope)) {
-      if ('files' in outputEnvelope || 'passed' in outputEnvelope) {
-        // Wrap top-level content into data
-        const { passed, ...rest } = outputEnvelope;
-        outputEnvelope = { data: rest };
-        if (passed !== undefined) outputEnvelope.passed = passed;
-      } else {
-        emit({ type: 'ERROR', message: 'output must have data or files field; got neither' });
-        return;
-      }
+      const { passed, ...rest } = outputEnvelope;
+      outputEnvelope = { data: rest };
+      if (passed !== undefined) outputEnvelope.passed = passed;
     }
 
     // Validate data against task.output schema if present
@@ -971,7 +979,7 @@ function step(workflowPath, opts) {
 
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
+    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output, ...(agentId ? { agent_id: agentId } : {}) });
     return;
   }
 
@@ -1071,7 +1079,7 @@ function step(workflowPath, opts) {
 
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
+    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output, ...(agentId ? { agent_id: agentId } : {}) });
     return;
   }
 }
@@ -1097,6 +1105,9 @@ function status(workflowPath) {
     task_progress: workflow.tasks.map(t => {
       const hist = t.history || [];
       const last = hist[hist.length - 1];
+      const durationMs = (t.started_at && t.finished_at)
+        ? new Date(t.finished_at).getTime() - new Date(t.started_at).getTime()
+        : null;
       return {
         name: t.name,
         phase: t.phase,
@@ -1106,6 +1117,7 @@ function status(workflowPath) {
         last_approval_status: last ? (last.approval_status || null) : null,
         started_at: t.started_at || null,
         finished_at: t.finished_at || null,
+        duration_ms: durationMs,
       };
     }),
   });
@@ -1120,15 +1132,17 @@ function emit(obj) {
 }
 
 function parseArgs(argv) {
-  const args = { workflow: null, step: false, status: false, output: null, approve: false, reject: null };
+  const args = { workflow: null, step: false, status: false, output: null, outputFile: null, approve: false, reject: null, agentId: null };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--workflow') { args.workflow = argv[++i]; }
     else if (a === '--step') { args.step = true; }
     else if (a === '--status') { args.status = true; }
     else if (a === '--output') { args.output = argv[++i]; }
+    else if (a === '--output-file') { args.outputFile = argv[++i]; }
     else if (a === '--approve') { args.approve = true; }
     else if (a === '--reject') { args.reject = argv[++i]; }
+    else if (a === '--agent-id') { args.agentId = argv[++i]; }
   }
   return args;
 }
@@ -1149,8 +1163,10 @@ function main() {
     } else if (args.step) {
       step(args.workflow, {
         outputJson: args.output,
+        outputFilePath: args.outputFile,
         approve: args.approve,
         rejectReason: args.reject,
+        agentId: args.agentId,
       });
     } else {
       emit({ type: 'ERROR', message: 'Must specify --step or --status' });
