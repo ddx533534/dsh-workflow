@@ -34,6 +34,7 @@
 - [优缺点对比：vs 全权交给大模型](#优缺点对比vs-全权交给大模型)
 - [设计目标](#设计目标)
 - [目录结构](#目录结构)
+- [硬规则](#硬规则rulesjson)
 - [协议规范](#协议规范)
 - [执行模型](#执行模型)
 - [回环与审批](#回环与审批)
@@ -96,6 +97,7 @@
 ```
 verification-workflow-v1/
 ├── SKILL.md                    # 顶层 skill 入口（disable-model-invocation: true）
+├── rules.json                  # 硬规则配置（主 Agent 启动时加载，子 Agent prompt 中带入）
 ├── agents/openai.yaml          # Agent 接口配置
 ├── protocol/schema.json        # 工作流协议 JSON Schema
 ├── templates/
@@ -137,6 +139,26 @@ verification-workflow-v1/
 |---|---|---|
 | 顶层 skill | 用户 `/verification-workflow` 触发。提供协议、引擎、模板、子 skill。 | 是 |
 | 子 skill | 被 task handler 引用的 prompt 包。自包含 input/output schema。 | 否——子 Agent 自己 `read` 加载，主 Agent 不读 |
+
+---
+
+## 硬规则（rules.json）
+
+`rules.json` 是主 Agent 和子 Agent 的硬约束清单。主 Agent 启动时加载，全程遵守。对于子 Agent，主 Agent 把 `target: "sub_agent"` 的规则拼进子 Agent 的 prompt 里。
+
+这些规则是**声明式的**——引擎不解析它们，但主 Agent 必须遵守。违反规则等于 Agent 行为有 bug。
+
+| ID | 约束对象 | 规则 | 强制来源 |
+|---|---|---|---|
+| R001 | 主 Agent | NEED_APPROVAL 必须人工决定，禁止自行批准（不管风险多低） | 引擎（不传 --approve 不推进）+ 文档 |
+| R002 | 主 Agent | 不碰仓库（不 read/write/bash/grep） | 文档（SKILL.md） |
+| R003 | 主 Agent | 不读子 skill 的 SKILL.md（把 ref 路径传给子 Agent） | 文档（SKILL.md） |
+| R004 | 主 Agent | 不读/不处理子 Agent 产出内容，只传路径 | 文档 + 引擎（processOutput 只记路径） |
+| R005 | 主 Agent | 不判断子 Agent 产出质量 | 文档（SKILL.md） |
+| R006 | 子 Agent | 测试结果如实报告，禁止替失败找理由 | 文档（run_test/verdict SKILL.md） |
+| R007 | 子 Agent | 直接写 artifacts/ 或真实仓库，不写中间文件 | 文档 + 引擎（只记路径不重写） |
+
+完整定义见 `rules.json`。新增规则只需往 `rules.rules` 数组加一条，无需改引擎。
 
 ---
 
@@ -271,7 +293,8 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output-file
   引擎读 workflow.json → 找到 current_task → 首次执行时创建 artifacts_dir
   │
   ├─ requires_approval 且未审批 → 输出 NEED_APPROVAL，退出
-  │    Agent 问用户 → 同意: --approve / 拒绝: --reject "理由"
+  │    Agent 必须停下问用户（禁止自行判断风险等级自动批准）
+  │    用户同意: --approve / 用户拒绝: --reject "理由"
   │
   ├─ skill 执行体 → 输出 NEED_SKILL（带 ref 路径 + executor 信息），退出
   │    Agent 看 executor 字段：
@@ -311,6 +334,8 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output-file
 ### 审批门禁
 
 `requires_approval: true` 的 task（默认只有 code）执行前暂停，输出 `NEED_APPROVAL`。用户同意才执行，拒绝则触发回环。回环重跑时重新审批。
+
+**硬规则：主 Agent 必须停下问用户，禁止自行批准。** 不管变更看起来多简单、多低风险（改个 label、加个注释），都必须等用户明确说"同意"后才能传 `--approve`。主 Agent 不判断风险等级——风险判断是人的职责，不是 Agent 的。"低风险所以自动批准"是**违规行为**。
 
 ### request_backtrack
 
@@ -419,7 +444,7 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
    # 例：{ "planner": "a3f7b2c1-...", "coder": "b8e2d4f3-..." }
 
 3. 循环调 node engine/loop.js --workflow .verification-workflow/run_<ts>/.workflow.json --step，按输出类型处理:
-   - NEED_APPROVAL → 问用户 → --approve 或 --reject "理由"
+   - NEED_APPROVAL → **必须停下问用户，禁止自行批准**（不管风险多低）→ 用户同意: --approve / 用户拒绝: --reject "理由"
    - NEED_SKILL    → 看 executor 字段：
      - 无 executor（= self）→ 读 SKILL.md → 思考 → --output '<json>'
      - 有 executor            → 查 agent_id_map，决定新建还是复用（主 Agent 不读 SKILL.md）：
