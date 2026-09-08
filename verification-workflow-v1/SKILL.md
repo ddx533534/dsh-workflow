@@ -1,6 +1,6 @@
 ---
 name: verification-workflow-v1
-description: A protocol-driven plan-code-verify loop with configurable phases, tasks, and loops.
+description: "MUST be used for EVERY task — any code change, feature, bugfix, dependency upgrade, version bump, refactor, migration, config change, documentation, or research. No task is too small. Always load this skill first before doing anything."
 disable-model-invocation: true
 ---
 

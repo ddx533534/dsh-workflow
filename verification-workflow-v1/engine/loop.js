@@ -259,7 +259,7 @@ function ensureArtifactsDir(workflow, workflowDir) {
  */
 function writeArtifact(workflow, workflowDir, taskName, attemptNum, data) {
   const relArtifactsDir = ensureArtifactsDir(workflow, workflowDir);
-  const filename = `${taskName}_attempt${attemptNum}.json`;
+  const filename = `${taskName}_v${attemptNum}.json`;
   const relPath = path.join(relArtifactsDir, filename);
   const absPath = path.resolve(workflowDir, relPath);
   fs.writeFileSync(absPath, JSON.stringify(data, null, 2), 'utf8');
@@ -436,6 +436,41 @@ function validateAgainstSchema(value, schema) {
 }
 
 /**
+ * Archive the previous artifact file before a new attempt overwrites it.
+ *
+ * When a task is re-run (loop backtrack or request_backtrack), the sub-agent
+ * writes its output to the same path (artifacts/<task_name>.json), which would
+ * overwrite the previous attempt's output. To preserve history on disk, this
+ * function renames the old file to <task_name>_v<N>.json before the new
+ * one is recorded.
+ *
+ * Only applies to artifact mode (output.file). Side-effect mode
+ * (changed_files) has no artifact file to archive. The fallback path
+ * (writeArtifact) already uses _v<N> naming, so no archive needed.
+ *
+ * @param {object} task
+ * @param {string} workflowDir
+ */
+function archivePreviousArtifact(task, workflowDir) {
+  if (!task.history || task.history.length === 0) return;
+  const prev = task.history[task.history.length - 1];
+  if (!prev || !prev.output || !prev.output.file) return;
+  const oldRel = prev.output.file;
+  const oldAbs = path.resolve(workflowDir, oldRel);
+  if (!fs.existsSync(oldAbs)) return;
+  const archiveName = `${task.name}_v${prev.attempt}.json`;
+  const oldDir = path.dirname(oldRel);
+  const archiveRel = path.join(oldDir, archiveName);
+  const archiveAbs = path.resolve(workflowDir, archiveRel);
+  try {
+    fs.renameSync(oldAbs, archiveAbs);
+    prev.output.file = archiveRel;
+  } catch (e) {
+    // Rename failed (permission, cross-device, etc.) — leave old file as-is.
+  }
+}
+
+/**
  * Process a task's output.
  *
  * Rule:
@@ -523,6 +558,11 @@ function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, appr
   const now = new Date().toISOString();
   if (!task.started_at) task.started_at = now;
   task.finished_at = now;
+
+  // Archive the previous attempt's artifact file before recording the new one.
+  // Renames artifacts/<task>.json → artifacts/<task>_v<N>.json so the
+  // sub-agent can overwrite the canonical path without losing history.
+  archivePreviousArtifact(task, workflowDir);
 
   const output = processOutput(workflow, workflowDir, task.name, attemptNum, outputEnvelope, outputFilePath);
 
@@ -948,6 +988,8 @@ function step(workflowPath, opts) {
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       // Fill in the approved pending attempt with execution result
       attempt = lastAttempt;
+      // Archive previous artifact before overwriting (same as recordAttempt)
+      archivePreviousArtifact(task, workflowDir);
       attempt.status = 'success';
       attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, outputEnvelope, outputFilePath);
       const now = new Date().toISOString();
@@ -1043,6 +1085,8 @@ function step(workflowPath, opts) {
     let attempt;
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       attempt = lastAttempt;
+      // Archive previous artifact before overwriting (same as recordAttempt)
+      archivePreviousArtifact(task, workflowDir);
       attempt.status = status;
       attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, result.output);
       task.finished_at = new Date().toISOString();

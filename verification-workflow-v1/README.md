@@ -225,7 +225,7 @@ verification-workflow-v1/
   "attempt": 1,
   "status": "success",
   "output": {
-    "file": "artifacts/tech_design_attempt1.json"
+    "file": "artifacts/tech_design_v1.json"
   }
 }
 ```
@@ -406,7 +406,7 @@ artifacts/
 └── verdict.json
 ```
 
-回环重跑时，子 Agent 覆盖同名文件（或加 `_attempt2` 后缀，由子 Agent 决定）。
+回环重跑时，引擎自动归档上一次的产物：把 `artifacts/<task>.json` 重命名为 `artifacts/<task>_v<N>.json`（N 为版本号，对应 attempt 号），然后子 Agent 写入新的 `artifacts/<task>.json`。历史产物不丢失，子 Agent 无感（始终写同名文件）。
 
 `passed`（仅 verdict task）始终留在 workflow.json，两种模式都可带，loop_controller 直接读。
 
