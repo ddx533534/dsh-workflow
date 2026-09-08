@@ -60,12 +60,12 @@
 - **流程不偏离**：引擎强制 task 顺序、回环、审批，执行体无法跳步或忘循环。
 - **同阶段上下文连续**：同阶段的 task 复用同一个子 Agent，planner 做 3 个 plan task 时记住前面的思考，不重复读。
 - **可审计**：workflow.json 每步有记录，产出有 artifact 文件。
-- **可恢复**：崩溃了从 workflow.json 续跑，不丢进度。
+- **可恢复**：崩溃了从 workflow.json 续跑——`findNextTask` 通过 `isTaskDone` 跳过 success 且非 expired 的 task，只重跑 expired 或未跑的。
 - **可复现**：流程结构固定，同样的声明跑同样的流程。
 
 ### 本设计的缺点
 
-- **流程是死的**：预定义的 loops 覆盖不了运行时发现的新问题（如 code 发现需求矛盾想回头改需求，但没声明这条回环，todo待解决）。
+- **流程是死的**：预定义的 loops 覆盖不了运行时发现的新问题（如 code 发现需求矛盾想回头改需求，但没声明这条回环）。已通过 `request_backtrack` 机制部分缓解——执行体可主动请求回头，引擎决定是否执行。
 - **跨阶段上下文断裂**：同阶段内的 task（如 plan 阶段 3 个 task）通过子 Agent 复用实现了上下文连续，但跨阶段切换时（planner → coder → verifier）上下文不传递，每个阶段的子 Agent 不知道其他阶段想过什么。
 - **简单任务过度工程**：改个 label 跑八个 task，开销远大于任务本身。
 - **声明本身可能错**：workflow.json 的 depends_on、handler.ref、loops 写错了流程就乱。
@@ -77,7 +77,7 @@
 
 ### 理想方向
 
-不是二选一，而是**在引擎保持控制权的前提下，给执行体一条反馈通道**——比如 task 产出里带 `request_backtrack`，执行体可以"请求"回头，引擎决定要不要执行。既有纪律，又有灵活性。（已记入 [TODO](TODO.md) 第 4 条）
+不是二选一，而是**在引擎保持控制权的前提下，给执行体一条反馈通道**——`request_backtrack` 已实现：task 产出里带 `request_backtrack`，执行体可以"请求"回头，引擎决定要不要执行（校验目标合法性、per-task 计数上限）。既有纪律，又有灵活性。
 
 ---
 
@@ -88,7 +88,7 @@
 3. **人工审批门禁**：指定 task 执行前必须人工审批，回环重跑时也要重新审批。
 4. **零代码扩展**：新增 task/phase/loop 只改 JSON，引擎不变。
 5. **历史保留**：每次执行（含回环重跑）都记录在案，永不覆盖。
-6. **增量持久化**：每次 Attempt 后即写盘，支持崩溃恢复。
+6. **增量持久化**：每次 Attempt 后即写盘，支持崩溃恢复——`isTaskDone` 统一判断 task 是否需（重）跑，重启后自动跳过已完成且未过期的 task。
 
 ---
 
@@ -245,6 +245,8 @@ verification-workflow-v1/
 
 审批相关字段（仅 `requires_approval` 的 task）：`approval_status`（null/approved/rejected）、`approved_by`、`approved_at`、`reject_reason`。
 
+回溯标记字段（所有 task）：`expired`（boolean，回溯后下游 task 的最后 Attempt 被标记，`isTaskDone` 判定需重跑）、`expired_reason`（如 `backtrack_from:code→tech_design`）。
+
 ### Loop
 
 ```json
@@ -271,6 +273,9 @@ verification-workflow-v1/
 {
   "current_task": "code",
   "loop_counts": { "verdict→code": 1 },
+  "backtrack_counts": {},
+  "backtrack_log": [],
+  "known_agents": ["planner", "coder"],
   "terminated": false,
   "terminate_reason": null
 }
@@ -330,7 +335,7 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output-file
 | verdict → code | `output.passed == false` | code | 3 | 验证失败 → 重新编码 |
 | code → tech_design | `approval_status == "rejected"` | tech_design | 2 | 审批拒绝 → 回退改方案 |
 
-两条 loop 共享 `checkLoops` 逻辑，各自独立计数。回溯时清除 target_task 之后所有 task 的 history（强制重跑）。
+两条 loop 共享 `checkLoops` 逻辑，各自独立计数。回溯时给 target_task 之后所有 task 的最后一个 Attempt 标 `expired: true`（不清除 history，记录完整保留，`findNextTask`/`advance` 自动跳过 expired 的 Attempt，重跑下游 task）。
 
 ### 审批门禁
 
@@ -358,7 +363,7 @@ Agent: node engine/loop.js --step [--approve | --reject "理由" | --output-file
 - **只允许往回跳**：目标必须是当前 task 的前序。往前跳会被忽略。
 - **per-task 计数**：每个 task 发起 backtrack 的次数独立计数，上限 `max_backtrack_per_task`（默认 3）。不管回到哪，同一个 task 最多发起 3 次。
 - **超限不终止**：请求被忽略，工作流正常推进。但记录在 `backtrack_log` 里供审计。
-- **jump_to 逻辑跟 loops 一致**：清除目标之后所有 task 的 history，强制重跑。
+- **jump_to 逻辑跟 loops 一致**：给目标之后所有 task 的最后一个 Attempt 标 `expired: true`，引擎自动重跑（history 不清除）。
 
 两套回溯机制独立计数，互不干扰：
 
@@ -831,7 +836,7 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 | 11 | `requires_approval` 在 task 级别 | code 执行前人工审批，回环重跑也重新审批 |
 | 12 | 审批拒绝走 loops 配置 | 复用 checkLoops，trigger_type=approval_rejected |
 | 13 | 两条 loop 共享一套检查逻辑 | loops 数组里两条配置，引擎按 trigger_type 分支 |
-| 14 | 回溯清除下游 history | 强制重跑，否则 advance 跳过已有 success 的 task |
+| 14 | 回溯标 expired 而非清 history | 保留审计轨迹，`isTaskDone` 判定 expired 的 Attempt 需重跑 |
 | 15 | 产出含 files → 引擎写真实仓库 | code task 直接写盘，不外置 artifact |
 | 16 | side-effect 模式 output 只存 changed_files + summary | 文件已在仓库，不需 artifact 中转 |
 | 17 | `passed` 留在 workflow.json | loop_controller 直接读，不用读文件 |
