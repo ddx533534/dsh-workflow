@@ -455,24 +455,26 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
      - 无 executor（= self）→ 读 SKILL.md → 思考 → --output '<json>'
      - 有 executor            → 查 agent_id_map，决定新建还是复用（主 Agent 不读 SKILL.md）：
        declared_name = executor.agent_id          # 来自 workflow.json 的声明名
+       artifact_path = run_dir + "/artifacts/" + task.name + ".json"
        task_prompt = "读 " + handler.ref + "/SKILL.md 并按其指引执行。输入：" + JSON.stringify(NEED_SKILL.input)
-       if declared_name not in agent_id_map:       # 映射表里没有 → 新建
-         result = subagent(
+                    + " 你必须把产出直接写到: " + artifact_path
+       if declared_name not in agent_id_map:       # 映射表里没有 → 新建（必须用 run_in_background=true）
+         real_id = subagent(
            prompt = task_prompt,                    # 传路径给子 Agent，不自己读
-           description = declared_name
-         )
-         agent_id_map[declared_name] = result.agent_id    # 存真实 id
-         output_file = result.output_file                 # 子 Agent 写到 /tmp/ 下的临时文件
+           description = declared_name,
+           run_in_background = true                  # 关键：后台运行，子 Agent 完成后保持 idle，可被 send_message 复用
+         )                                           # subagent 立即返回 real_id，不阻塞
+         agent_id_map[declared_name] = real_id       # 存真实 id
        else:                                        # 映射表里有 → 复用
          real_id = agent_id_map[declared_name]
-         result = send_message(
+         send_message(                               # send_message 只确认投递，不返回结果
            agent_id = real_id,
-           message  = task_prompt                   # 同样传路径，不自己读
+           message  = task_prompt                     # 同样传路径，不自己读
          )
-         output_file = result.output_file
-       # 子 Agent 直接把产出写到 artifacts/<task_name>.json
-       # 主 Agent 只传这个路径给引擎，引擎只记路径、不读内容、不重写
-       --output-file '<output_file>' --agent-id '<real_id>'
+       # 子 Agent 在后台工作，把产出直接写到 artifacts/<task_name>.json
+       # 主 Agent 不 busy-poll、不 sleep——可做其他独立工作
+       # 当 runtime 发来完成通知后，主 Agent 把 artifact_path 喂回引擎
+       --output-file '<artifact_path>' --agent-id '<real_id>'
    - DONE          → 继续 --step
    - LOOP_BACK     → 继续 --step（声明式回环，引擎已移指针）
    - BACKTRACK     → 继续 --step（执行体请求回头，引擎已移指针）
@@ -482,6 +484,8 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
 ```
 
 > **注意**：引擎输出的 `executor.reuse` 是参考值（基于 `context.known_agents` 判断），但主 Agent 以自己的 `agent_id_map` 为真相——映射表里有就复用，没有就新建。这样即使引擎状态被重置，主 Agent 仍能正确复用已活的子 Agent。
+
+> **注意**：`subagent` 必须用 `run_in_background: true` 创建。前台子 Agent（`run_in_background: false`）执行完即终止，`send_message` 复用时会报 "subagent unavailable"。后台子 Agent 完成后进入 idle 状态，session 持久化，`send_message` 发新任务时上下文连续。`send_message` 只确认投递，不返回结果——结果通过 runtime 的异步完成通知到达。
 
 ### 执行器机制
 
@@ -507,7 +511,11 @@ Agent 生成 workflow.json → 逐步驱动 plan → code → verify → 验证�
 
 #### 子 Agent 生命周期
 
-子 Agent 跑完一轮后**不会消失**——它进入 idle 状态，Session 持久化，带着之前的上下文等着。`send_message` 给它发新任务时，新消息追加到同一个 Session，上下文连续。回环重跑同一个 task 时，同一个子 Agent 继续——它记得上一轮做了什么。
+子 Agent 用 `run_in_background: true` 创建后，跑完一轮**不会消失**——它进入 idle 状态，Session 持久化，带着之前的上下文等着。`send_message` 给它发新任务时，新消息追加到同一个 Session，上下文连续。回环重跑同一个 task 时，同一个子 Agent 继续——它记得上一轮做了什么。
+
+> ⚠️ **必须用 `run_in_background: true`**。前台子 Agent（`run_in_background: false`）执行完即终止，无法被 `send_message` 复用——调用时会报 `Error: subagent "<name>" is unavailable`。这是子 Agent 复用失败的最常见原因。
+>
+> `send_message` 只确认消息投递，**不返回子 Agent 的产出**。子 Agent 在后台工作，完成后 runtime 会给主 Agent 发异步完成通知。主 Agent 收到通知后，读 artifact 文件路径，喂回引擎。在等待期间主 Agent 可以做其他独立工作，不要 busy-poll 或 sleep。
 
 #### 主 Agent 的定位
 
@@ -551,7 +559,7 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 - `--output '<json>'`：产出内容小（几行 JSON）时直接传，简单但受命令行长度限制
 - `--output-file '<path>'`：产出内容大时，子 Agent 把产出写到文件，主 Agent 只传文件路径给引擎。**推荐统一用 `--output-file`**——主 Agent 上下文里只有文件路径，没有产出内容，上下文更干净
 
-`--agent-id` 可选。主 Agent 调 `subagent` 或 `send_message` 后，harness 返回真实子 Agent id，主 Agent 喂回产出时通过 `--agent-id` 传给引擎。引擎在 `DONE` 输出里带上这个 id，**用于日志验证复用**：连续两次 `DONE` 的 `agent_id` 相同 = 复用了同一个子 Agent。`--status` 输出里带 `duration_ms`（每步耗时），用于查看整个过程分阶段耗时。
+`--agent-id` 可选。主 Agent 调 `subagent`（`run_in_background: true`）拿到真实子 Agent id 后存入 `agent_id_map`，喂回产出时通过 `--agent-id` 传给引擎。引擎在 `DONE` 输出里带上这个 id，**用于日志验证复用**：连续两次 `DONE` 的 `agent_id` 相同 = 复用了同一个子 Agent。`--status` 输出里带 `duration_ms`（每步耗时），用于查看整个过程分阶段耗时。
 
 ### 引擎输出
 
