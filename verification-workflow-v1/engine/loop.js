@@ -52,10 +52,10 @@ function loadWorkflow(workflowPath) {
     throw new Error(`Unsupported protocol version: ${workflow.version}`);
   }
   if (!workflow.run_name || typeof workflow.run_name !== 'string') {
-    throw new Error('workflow.run_name is required (English short name)');
+    throw new Error('workflow.run_name is required (English short name, e.g. change_label)');
   }
   if (!/^[a-z][a-z0-9_]*$/.test(workflow.run_name)) {
-    throw new Error(`workflow.run_name must match ^[a-z][a-z0-9_]*$, got: ${workflow.run_name}`);
+    throw new Error(`workflow.run_name must match ^[a-z][a-z0-9_]*$ (lowercase English, digits, underscores; first char must be a letter). Got: "${workflow.run_name}"`);
   }
   if (!Array.isArray(workflow.phases) || workflow.phases.length === 0) {
     throw new Error('workflow.phases must be a non-empty array');
