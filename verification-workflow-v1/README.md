@@ -674,15 +674,18 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 
 #### 4. code（code 阶段，coder 子 Agent，**需审批**）
 
-**输入**（引擎 `gatherInput` 产出，`depends_on: ["test_case_design"]`）：
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["tech_design", "test_case_design"]`）：
 ```json
 {
+  "tech_design": {
+    "file": "artifacts/tech_design.json"
+  },
   "test_case_design": {
     "file": "artifacts/test_case_design.json"
   }
 }
 ```
-> 注意：code 的 SKILL.md 声明 `required: [tech_design, test_case_design]`，但 workflow_template 的 `depends_on` 只有 `["test_case_design"]`。tech_design 的内容可以通过 test_case_design 间接获取（test_case_design 的 input 里有 tech_design）。如需直接引用，应在 workflow.json 的 `depends_on` 里加 `"tech_design"`。
+子 Agent 拿到两个路径，自己 `read` 文件内容。
 
 **输出**（**直接写仓库模式**，子 Agent 自己用工具写文件到真实仓库，产出 JSON 里只有路径列表）：
 ```json
@@ -710,8 +713,6 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 ```
 注意：这里传的是 `changed_files`（路径列表）和 `summary`，**不是文件内容**。子 Agent 拿到路径后自己用工具从真实仓库 `read` 文件内容来 review。
 
-> code_review 的 SKILL.md 还声明了 `tech_design` input（用于检查设计对齐），但 workflow_template 的 `depends_on` 只有 `["code"]`。如需 tech_design，应在 `depends_on` 里加 `"tech_design"`。
-
 **输出**（子 Agent 写到 `artifacts/code_review.json`）：
 ```json
 {
@@ -731,15 +732,15 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 
 #### 6. run_test（verify 阶段，verifier 子 Agent）
 
-**输入**（引擎 `gatherInput` 产出，`depends_on: ["code_review"]`）：
+**输入**（引擎 `gatherInput` 产出，`depends_on: ["test_case_design"]`）：
 ```json
 {
-  "code_review": {
-    "file": "artifacts/code_review.json"
+  "test_case_design": {
+    "file": "artifacts/test_case_design.json"
   }
 }
 ```
-> run_test 的 SKILL.md 声明需要 `code`（changed_files）和 `test_case_design`，但 workflow_template 的 `depends_on` 只有 `["code_review"]`。如需 code 和 test_case_design，应在 `depends_on` 里加 `"code"` 和 `"test_case_design"`。实际使用时建议修改 `depends_on` 为 `["code", "test_case_design"]`。
+子 Agent 只拿测试用例，**不看实现代码**——这是黑盒测试。verifier 像 QA 一样：读测试用例 → 跑测试 → 报结果，不关心改了哪些文件。
 
 **输出**（子 Agent 写到 `artifacts/run_test.json`）：
 ```json
@@ -797,12 +798,12 @@ node engine/loop.js --workflow <path> --step --output-file '<path>' --agent-id '
 | requirement_clarification | [] | `{ raw_requirement }` 来自用户 | 主 Agent 拼 prompt |
 | tech_design | [requirement_clarification] | `{ requirement_clarification: { file } }` | 路径 |
 | test_case_design | [tech_design] | `{ tech_design: { file } }` | 路径 |
-| code | [test_case_design] | `{ test_case_design: { file } }` | 路径 |
+| code | [tech_design, test_case_design] | `{ tech_design: { file }, test_case_design: { file } }` | 路径 |
 | code_review | [code] | `{ code: { changed_files, summary } }` | 内联值 |
-| run_test | [code_review] | `{ code_review: { file } }` | 路径 |
+| run_test | [test_case_design] | `{ test_case_design: { file } }` | 路径 |
 | verdict | [run_test] | `{ run_test: { file } }` | 路径 |
 
-> **注意**：code、code_review、run_test 的 SKILL.md 声明的 required input 比 workflow_template 的 `depends_on` 多。如果子 Agent 需要更多前驱数据，修改 workflow.json 的 `depends_on` 加上前驱 task 名即可，引擎会自动收集。
+> 所有 task 的 `depends_on` 与各 SKILL.md 声明的 required input 已对齐。如需子 Agent 获取更多前驱数据，修改 workflow.json 的 `depends_on` 加上前驱 task 名即可，引擎会自动收集。
 
 ### run_test 和 verdict 的判定规则
 

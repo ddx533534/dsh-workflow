@@ -57,7 +57,7 @@
         "ref": "skills/code"
       },
       "executor": "subagent:coder",
-      "depends_on": ["test_case_design"],
+      "depends_on": ["tech_design","test_case_design"],
       "requires_approval": true
     },
     {
@@ -78,7 +78,7 @@
         "ref": "skills/run_test"
       },
       "executor": "subagent:verifier",
-      "depends_on": ["code_review"]
+      "depends_on": ["test_case_design"]
     },
     {
       "name": "verdict",

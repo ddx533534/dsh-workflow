@@ -4,20 +4,10 @@ description: Execute test cases against the implemented code and collect results
 input:
   type: object
   properties:
-    code:
-      type: object
-      description: Output from the code task. Contains changed_files (paths) and summary. The actual files are in the real repository.
-      properties:
-        changed_files:
-          type: array
-          items:
-            type: string
-        summary:
-          type: string
     test_case_design:
       type: object
       description: Output data from the test_case_design task (test cases to run).
-  required: [code, test_case_design]
+  required: [test_case_design]
 output:
   type: object
   description: The content of the artifact file (output.data).
@@ -72,15 +62,17 @@ Record the failure reason in the `error` field — this gives the verdict task t
 ## Input
 
 You receive:
-- `code` task output — `changed_files` (paths written to the real repo) and `summary`
 - `test_case_design` task output — test cases with input and expected
 
-**Read the changed files from the real repository** using your tools (read, bash) to understand what was implemented, then run each test case.
+You are a **black-box tester**. You do NOT read the implementation code. You only:
+1. Read the test cases.
+2. Run each test case against the project (build, execute, check output).
+3. Report what happened — pass or fail.
 
 ## What to do
 
-1. Read the changed files from the real repository.
-2. For each test case, run it against the implemented code.
+1. Read the test cases from `test_case_design` output.
+2. For each test case, run it against the project.
 3. Compare actual result to expected.
 4. If the result matches expected → `passed: true`.
 5. If the result does not match, or the test could not run (build error, environment issue, timeout, etc.) → `passed: false`, and record the reason in `error`.
