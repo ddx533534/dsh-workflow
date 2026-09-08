@@ -436,13 +436,31 @@ function validateAgainstSchema(value, schema) {
 }
 
 /**
- * Archive the previous artifact file before a new attempt overwrites it.
+ * Archive the previous artifact file before a new attempt is recorded.
  *
  * When a task is re-run (loop backtrack or request_backtrack), the sub-agent
- * writes its output to the same path (artifacts/<task_name>.json), which would
- * overwrite the previous attempt's output. To preserve history on disk, this
- * function renames the old file to <task_name>_v<N>.json before the new
- * one is recorded.
+ * writes its output to the same canonical path (artifacts/<task_name>.json),
+ * which overwrites the previous attempt's content. By the time the engine
+ * runs this function (during --step --output-file), the sub-agent has ALREADY
+ * written the new content to that path.
+ *
+ * To preserve history on disk, this function COPIES the file at the previous
+ * attempt's output path to <task_name>_v<N>.json, then points the previous
+ * attempt's output.file to the archive copy. The canonical path keeps the
+ * new content (so the current attempt and downstream tasks read correctly).
+ *
+ * We use copy (not rename) because the sub-agent writes BEFORE the engine
+ * runs — the file at the canonical path is already the NEW content. Renaming
+ * would move the new content away and leave the canonical path missing,
+ * breaking downstream tasks. Copying preserves the new content in place
+ * while still creating an archive copy for history.
+ *
+ * Note: the archive copy's content equals the NEW attempt's content (since
+ * the old content was already overwritten by the sub-agent). The old content
+ * is lost — this is an inherent limitation of the "sub-agent writes first,
+ engine archives after" timing. To truly preserve old content, the engine
+ would need to archive BEFORE the sub-agent writes, which is not possible
+ with the current single-step architecture.
  *
  * Only applies to artifact mode (output.file). Side-effect mode
  * (changed_files) has no artifact file to archive. The fallback path
@@ -463,10 +481,14 @@ function archivePreviousArtifact(task, workflowDir) {
   const archiveRel = path.join(oldDir, archiveName);
   const archiveAbs = path.resolve(workflowDir, archiveRel);
   try {
-    fs.renameSync(oldAbs, archiveAbs);
+    // Copy (not rename): the canonical path keeps the new content for the
+    // current attempt and downstream tasks; the archive copy preserves a
+    // snapshot for history. Using rename would move the new content away
+    // and break the canonical path.
+    fs.copyFileSync(oldAbs, archiveAbs);
     prev.output.file = archiveRel;
   } catch (e) {
-    // Rename failed (permission, cross-device, etc.) — leave old file as-is.
+    // Copy failed (permission, cross-device, etc.) — leave old file as-is.
   }
 }
 
@@ -560,8 +582,9 @@ function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, appr
   task.finished_at = now;
 
   // Archive the previous attempt's artifact file before recording the new one.
-  // Renames artifacts/<task>.json → artifacts/<task>_v<N>.json so the
-  // sub-agent can overwrite the canonical path without losing history.
+  // Copies artifacts/<task>.json → artifacts/<task>_v<N>.json so the
+  // canonical path keeps the new content (sub-agent already wrote it) and
+  // downstream tasks can read it. See archivePreviousArtifact for details.
   archivePreviousArtifact(task, workflowDir);
 
   const output = processOutput(workflow, workflowDir, task.name, attemptNum, outputEnvelope, outputFilePath);
@@ -988,7 +1011,7 @@ function step(workflowPath, opts) {
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       // Fill in the approved pending attempt with execution result
       attempt = lastAttempt;
-      // Archive previous artifact before overwriting (same as recordAttempt)
+      // Archive previous artifact (copy to _v<N>.json) — sub-agent already wrote new content
       archivePreviousArtifact(task, workflowDir);
       attempt.status = 'success';
       attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, outputEnvelope, outputFilePath);
@@ -1085,7 +1108,7 @@ function step(workflowPath, opts) {
     let attempt;
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       attempt = lastAttempt;
-      // Archive previous artifact before overwriting (same as recordAttempt)
+      // Archive previous artifact (copy to _v<N>.json) — sub-agent already wrote new content
       archivePreviousArtifact(task, workflowDir);
       attempt.status = status;
       attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, result.output);

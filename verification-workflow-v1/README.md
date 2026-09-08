@@ -406,7 +406,9 @@ artifacts/
 └── verdict.json
 ```
 
-回环重跑时，引擎自动归档上一次的产物：把 `artifacts/<task>.json` 重命名为 `artifacts/<task>_v<N>.json`（N 为版本号，对应 attempt 号），然后子 Agent 写入新的 `artifacts/<task>.json`。历史产物不丢失，子 Agent 无感（始终写同名文件）。
+回环重跑时，引擎自动归档上一次的产物：把 `artifacts/<task>.json` **复制**到 `artifacts/<task>_v<N>.json`（N 为版本号，对应 attempt 号），旧 Attempt 的 `output.file` 指向归档副本。子 Agent 无感（始终写同名文件 `artifacts/<task>.json`）。canonical 路径上保留最新产出，下游 task 能正常读取。
+
+> ⚠️ **归档用 copy 不用 rename**。因为子 Agent 在引擎 `--step` 之前就把新产出写到 `artifacts/<task>.json`（覆盖了旧内容），引擎执行归档时该文件已经是新内容。如果用 rename 会把新内容移走，canonical 路径上文件丢失，下游 task 读不到产出。用 copy 则 canonical 路径保留新内容，归档副本也留一份。旧内容（上一轮的产出）被子 Agent 覆盖了，无法恢复——这是"子 Agent 先写、引擎后归档"架构的固有限制。
 
 `passed`（仅 verdict task）始终留在 workflow.json，两种模式都可带，loop_controller 直接读。
 
