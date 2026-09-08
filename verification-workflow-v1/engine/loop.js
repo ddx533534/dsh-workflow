@@ -159,9 +159,32 @@ function getTask(workflow, name) {
 }
 
 /**
+ * Is a task "done" (completed and still valid — does not need to run)?
+ * A task needs (re)execution when:
+ *   - it has no history (never ran), OR
+ *   - its last attempt was not successful, OR
+ *   - its last attempt is marked expired (a predecessor was re-run via
+ *     loop backtrack or request_backtrack, so this result is out of date).
+ *
+ * This is the single source of truth used by both findNextTask and advance,
+ * which means crash recovery and loop backtracking share the same logic.
+ *
+ * @param {object} task
+ * @returns {boolean} — true if the task is done and should be skipped
+ */
+function isTaskDone(task) {
+  const hist = task.history || [];
+  const last = hist[hist.length - 1];
+  if (!last) return false;                          // never ran
+  if (last.status !== 'success') return false;       // last run wasn't successful
+  if (last.expired === true) return false;            // succeeded but out of date
+  return true;
+}
+
+/**
  * Find the next task to execute.
  * - If context.current_task is set, resume from there.
- * - Otherwise find the first task whose last attempt wasn't success.
+ * - Otherwise find the first task that is not "done" (see isTaskDone).
  *
  * NOTE: A task with requires_approval that has a pending Attempt (approval_status=null)
  * is "in progress" — findNextTask returns it so the engine can re-enter the approval flow.
@@ -183,11 +206,9 @@ function findNextTask(workflow) {
     }
   }
 
-  // Otherwise find the first task without a successful last attempt
+  // Otherwise find the first task that is not done
   for (const t of ordered) {
-    const hist = t.history || [];
-    const last = hist[hist.length - 1];
-    if (!last || last.status !== 'success') {
+    if (!isTaskDone(t)) {
       return t;
     }
   }
@@ -524,7 +545,7 @@ function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, appr
 }
 
 /**
- * Advance context.current_task to the next uncompleted task.
+ * Advance context.current_task to the next task that is not done.
  * @param {object} workflow
  * @param {object} justFinishedTask
  */
@@ -532,12 +553,9 @@ function advance(workflow, justFinishedTask) {
   const ordered = orderTasks(workflow.tasks);
   const idx = ordered.findIndex(t => t.name === justFinishedTask.name);
   for (let i = idx + 1; i < ordered.length; i++) {
-    const t = ordered[i];
-    const hist = t.history || [];
-    const last = hist[hist.length - 1];
-    if (!last || last.status !== 'success') {
-      workflow.context.current_task = t.name;
-      workflow.context.current_phase = t.phase;
+    if (!isTaskDone(ordered[i])) {
+      workflow.context.current_task = ordered[i].name;
+      workflow.context.current_phase = ordered[i].phase;
       return;
     }
   }
@@ -592,22 +610,25 @@ function checkLoops(workflow, task) {
       workflow.context.current_task = target.name;
       workflow.context.current_phase = target.phase;
 
-      // Mark all tasks AFTER target_task (in declaration order) as stale.
-      // Their previous results were based on stale predecessor outputs.
-      // We keep the history for audit but mark each Attempt as stale so
-      // findNextTask/advance know to re-run them.
-      // For simplicity, we clear started_at/finished_at and mark last attempt
-      // as stale by setting a flag. But since we want to keep it simple:
-      // we clear history of downstream tasks (they will be re-run fresh).
+      // Mark all tasks AFTER target_task (in declaration order) as expired.
+      // Their previous results were based on predecessor outputs that have
+      // now changed, so those results are out of date. We do NOT clear
+      // history — we keep every attempt for audit and only set expired=true
+      // on each downstream task's last attempt. isTaskDone (used by
+      // findNextTask and advance) treats an expired last attempt as
+      // "needs re-run", so the downstream tasks will be re-executed while
+      // their old history stays on the record.
       // The rejected/failed attempts on the trigger task itself are preserved.
       const ordered = orderTasks(workflow.tasks);
       const targetIdx = ordered.findIndex(t => t.name === target.name);
       for (let i = targetIdx + 1; i < ordered.length; i++) {
-        // Clear downstream task history — they need full re-run.
-        // Their previous artifacts remain on disk for reference.
-        ordered[i].history = [];
-        ordered[i].started_at = null;
-        ordered[i].finished_at = null;
+        const hist = ordered[i].history || [];
+        const last = hist[hist.length - 1];
+        if (last) {
+          last.expired = true;
+          last.expired_reason = `backtrack_from:${loop.trigger_task}→${loop.target_task}`;
+        }
+        // Previous artifacts remain on disk for reference.
       }
 
       return { triggered: true, loop };
@@ -681,11 +702,15 @@ function checkRequestBacktrack(workflow, task) {
   counts[task.name] = current + 1;
   workflow.context.backtrack_counts = counts;
 
-  // Clear downstream history (same as checkLoops)
+  // Mark downstream tasks' last attempt as expired (same as checkLoops).
+  // History is preserved; isTaskDone treats expired attempts as "needs re-run".
   for (let i = targetIdx + 1; i < ordered.length; i++) {
-    ordered[i].history = [];
-    ordered[i].started_at = null;
-    ordered[i].finished_at = null;
+    const hist = ordered[i].history || [];
+    const last = hist[hist.length - 1];
+    if (last) {
+      last.expired = true;
+      last.expired_reason = `backtrack_from:${task.name}→${req.to}`;
+    }
   }
 
   workflow.context.current_task = target.name;

@@ -217,6 +217,16 @@
           "type": ["string", "null"],
           "default": null,
           "description": "Why the approval was rejected, if applicable."
+        },
+        "expired": {
+          "type": "boolean",
+          "default": false,
+          "description": "Runtime. True when this Attempt's result is no longer valid because a predecessor was re-run (loop backtrack or request_backtrack). The attempt's history is preserved for audit; only this flag is set. findNextTask and advance treat a task whose last Attempt is expired as 'needs re-run' — same path used by crash recovery."
+        },
+        "expired_reason": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Why this Attempt was marked expired. e.g. 'backtrack_from:verdict→code' or 'backtrack_from:code→tech_design'."
         }
       }
     },
