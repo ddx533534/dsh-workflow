@@ -155,6 +155,7 @@ verification-workflow-v1/
 | R003 | 主 Agent | 不读子 skill 的 SKILL.md（把 ref 路径传给子 Agent） | 文档（SKILL.md） |
 | R004 | 主 Agent | 不读/不处理子 Agent 产出内容，只传路径 | 文档 + 引擎（processOutput 只记路径） |
 | R005 | 主 Agent | 不判断子 Agent 产出质量 | 文档（SKILL.md） |
+| R008 | 主 Agent | 禁止自行终止 loop——verdict 返回 passed:false 时必须继续 --step，让引擎的 loop 机制决定回环还是耗尽 max_iterations。不能读失败原因后判断"环境问题，返工没用"就自己停 | 引擎（checkLoops + max_iterations）+ 文档 |
 | R006 | 子 Agent | 测试结果如实报告，禁止替失败找理由 | 文档（run_test/verdict SKILL.md） |
 | R007 | 子 Agent | 直接写 artifacts/ 或真实仓库，不写中间文件 | 文档 + 引擎（只记路径不重写） |
 

@@ -33,6 +33,12 @@
       "enforced_by": "documentation (SKILL.md step 5)"
     },
     {
+      "id": "R008",
+      "target": "main_agent",
+      "rule": "The main Agent must NEVER terminate the loop on its own. When verdict returns passed:false, the Agent must continue --step and let the engine's loop mechanism decide whether to backtrack or exhaust max_iterations. The Agent must NOT read the failure reason and decide 'this is an environment issue, retrying won't help'. That judgment is not the Agent's to make. Even if the failure looks like an environment problem, the Agent must keep driving the loop until the engine itself terminates with max_iterations_exceeded. Short-circuiting the loop is a violation.",
+      "enforced_by": "engine (checkLoops + max_iterations) + documentation (SKILL.md step 4)"
+    },
+    {
       "id": "R006",
       "target": "sub_agent",
       "rule": "Sub-agents must report test results truthfully. Any failure (assertion mismatch, build error, environment missing, timeout) must be marked as failed. No finding excuses for failures.",
