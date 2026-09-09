@@ -1,6 +1,6 @@
 ---
 name: verification-workflow-v1
-description: A protocol-driven plan-code-verify loop with configurable phases, tasks, and loops.
+description: "MUST be used for EVERY task — any code change, feature, bugfix, dependency upgrade, version bump, refactor, migration, config change, documentation, or research. No task is too small. Always load this skill first before doing anything."
 disable-model-invocation: true
 ---
 
@@ -14,16 +14,30 @@ This skill provides a protocol-driven workflow for plan → code → verify loop
 - `templates/workflow_template.json` — a pre-filled declaration with the 7 default tasks
 - `engine/loop.js` — the single-step loop engine that drives execution
 - `skills/` — sub-skills referenced by task handlers (self-contained, each declares its own input/output schema)
+- `rules.json` — hard rules for main Agent and sub-agents (MUST be loaded at startup and obeyed)
 
 ## How to use
 
 1. The user triggers this skill with `/verification-workflow <requirement>`.
-2. The Agent generates a `workflow.json` based on the user's requirement, using `templates/workflow_template.json` as the starting point. The Agent creates a run directory `.verification-workflow/run_<YYYYMMDDHHmmss>/` and writes the workflow to `.verification-workflow/run_<ts>/.workflow.json`.
-3. The Agent drives execution by repeatedly calling `node engine/loop.js --step`:
+2. **The Agent loads `rules.json` and obeys every rule throughout the run.** For sub-agents, the Agent includes the `target: "sub_agent"` rules in the sub-agent's prompt. These rules are hard constraints, not suggestions — violating them is a bug in the Agent's behavior.
+3. The Agent generates a `workflow.json` by **templating** — it only fills in `run_name` and uses the template's default config. Write to `.verification-workflow/run_<YYYYMMDDHHmmss>/.workflow.json`. `run_name`: English short name from the requirement; spaces/hyphens → underscores, camelCase → snake_case. Example: `change_label`.
+4. The Agent drives execution by repeatedly calling `node engine/loop.js --step`, maintaining an `agent_id_map` (declared_name → real agent_id) for sub-agent reuse. **The main Agent never touches the repository** — all business data collection (reading code, grepping, running commands) is done by sub-agents in their own context:
+   - **`NEED_APPROVAL` → MUST stop and ask the user.** The Agent must never approve on its own — regardless of how low-risk the change appears. No "auto-approve for simple changes." The Agent calls `--approve` ONLY after the user explicitly says yes; calls `--reject "reason"` when the user says no. This is a hard rule, not a suggestion.
    - For `handler.type == "script"`: the engine executes the script directly.
-   - For `handler.type == "skill"`: the engine outputs `NEED_SKILL: <ref>, INPUT: <json>` and exits. The Agent reads the sub-skill's `SKILL.md` at `<ref>/SKILL.md`, thinks per its prompt, produces output, then feeds it back via `node engine/loop.js --step --output "<json>"`.
+   - For `handler.type == "skill"`: the engine outputs `NEED_SKILL: <ref>, INPUT: <json>, EXECUTOR: <info>` and exits. The Agent handles it based on the `executor` field:
+     - No `executor` (= self): the Agent reads the sub-skill's `SKILL.md` at `<ref>/SKILL.md`, thinks per its prompt, produces output, then feeds it back via `--output "<json>"`.
+     - Has `executor`: the Agent looks up `executor.agent_id` (declared name, e.g. "planner") in its `agent_id_map`. **The main Agent does NOT read SKILL.md itself** — it passes the `ref` path, `input`, and the `target: "sub_agent"` rules from `rules.json` to the sub-agent. **Sub-agents MUST be created with `run_in_background: true`** so they stay alive (idle) after completing a task and can be reused by `send_message` for subsequent tasks. A `run_in_background: false` sub-agent terminates after one task and CANNOT be reused — `send_message` to it will fail with "subagent unavailable".
+       - Not in map → create: call `subagent(prompt="Read <ref>/SKILL.md and follow its instructions. Input: <input JSON>. Hard rules (must obey): <sub_agent rules from rules.json>. You must write your output directly to: <run_dir>/artifacts/<task_name>.json", description=declared_name, run_in_background=true)` → harness immediately returns a real agent_id → store `agent_id_map[declared_name] = real_id` → the sub-agent works in the background → when it finishes, the runtime sends the Agent a completion notice → the sub-agent has already written its output **directly to `artifacts/<task_name>.json`** → Agent feeds back via `--output-file "<artifact_path>" --agent-id "<real_id>"`.
+       - In map → reuse: call `send_message(agent_id=real_id, message="New task: read <ref>/SKILL.md. Input: <input JSON>. Hard rules (must obey): <sub_agent rules from rules.json>. You must write your output directly to: <run_dir>/artifacts/<task_name>.json")` → `send_message` only confirms delivery (it does NOT return the sub-agent's result) → the sub-agent works in the background → when it finishes, the runtime sends the Agent a completion notice → the sub-agent has written output **directly to `artifacts/<task_name>.json`** → Agent feeds back via `--output-file "<artifact_path>" --agent-id "<real_id>"`.
+       - **Async completion handling**: after `subagent` or `send_message`, the Agent does NOT busy-poll or sleep. It can proceed with other independent work (e.g. preparing the next engine command). When the runtime delivers the completion notice, the Agent then feeds the artifact file path back to the engine. If no independent work is available, the Agent simply waits for the notice.
+     - The Agent does not read SKILL.md, does not read/process the output, does not manually wrap `{data:...}`, and does not write any intermediate files. The sub-agent writes directly to `artifacts/`; the engine only records the path. `--agent-id` is optional but enables log verification: consecutive `DONE` outputs with the same `agent_id` confirm sub-agent reuse.
    - When all tasks are done: the engine outputs `FINISHED`.
-4. Loop backtracks (e.g. verify fail → code) are decided by the engine, not the Agent. The engine checks the `loops` config and jumps `current_task` back to the target when triggered, up to `max_iterations`.
+5. Loop backtracks (e.g. verify fail → code) are decided by the engine, not the Agent. The engine checks the `loops` config and jumps `current_task` back to the target when triggered, up to `max_iterations`. On re-run, the engine outputs `reuse: true` (it saw the declared name before), and the Agent reuses the existing sub-agent — which still has the context from the previous round.
+6. The main Agent is a **pure flow scheduler + user interface**. It does NOT: inspect the repository, read code, collect business data, judge sub-agent output, or think about business logic. It only: translates the user's requirement into a workflow.json declaration, drives the `--step` loop, creates/reuses sub-agents, relays output, and communicates with the user. The main Agent's context holds only: the user's requirement, the workflow.json declaration, engine output messages (with compact summaries), `--output` JSON (compact results), the `agent_id_map`, `rules.json`, and user dialogue — **no repository content, no code, no business data.**
+
+> **Two kinds of id**: The engine only tracks **declared names** (from workflow.json's `executor` field, stored in `context.known_agents`). The main Agent maintains the mapping from declared names to **real agent_ids** returned by harness. The engine never holds real ids — they are runtime references that belong in the Agent's context, not in workflow.json.
+
+> **Sub-agent lifecycle**: A sub-agent created with `run_in_background: true` stays alive after completing a task — it enters idle state and its session is persisted with full conversation context. `send_message` to an idle sub-agent starts a new turn in the same session, so context is continuous. This is what enables reuse across tasks (e.g., the same planner doing requirement_clarification → tech_design → test_case_design) and across loop backtracks (the same coder remembers what it changed last round). A sub-agent created with `run_in_background: false` terminates after returning its result and CANNOT be reused.
 
 ## Protocol summary
 
@@ -31,13 +45,17 @@ See `protocol/schema.json` for the full definition. Core structure:
 
 - **Workflow** — root: `{ version, run_name, artifacts_dir?, project_root?, phases[], tasks[], loops[], context }`
 - **Phase** — major stage: `{ name, tasks[] }`
-- **Task** — concrete task: `{ name, phase, handler{type,ref}, depends_on?, input?, output?, started_at, finished_at, history[] }`
+- **Task** — concrete task: `{ name, phase, handler{type,ref}, executor?, depends_on?, input?, output?, started_at, finished_at, history[] }`
 - **Attempt** — execution record: `{ attempt, status:"success"|"fail", output:{data, passed?} }`
 - **Loop** — backtrack config: `{ trigger_task, trigger_field, trigger_when, target_task, max_iterations }`
-- **Context** — runtime state: `{ current_phase, current_task, loop_counts{}, terminated, terminate_reason }`
+- **Context** — runtime state: `{ current_phase, current_task, loop_counts{}, known_agents[], terminated, terminate_reason }`
 
 Handler types:
-- `skill` — a sub-skill under `skills/`, executed by the Agent reading its prompt
+- `skill` — a sub-skill under `skills/`, executed by the Agent or a sub-agent reading its prompt
 - `script` — an external script executed via bash
+
+Executor types (task.executor):
+- `self` (default) — main Agent executes directly
+- `subagent:<name>` — a named sub-agent executes. `<name>` is a **declared name** (e.g. "planner"), not a harness agent_id. Same declared name across tasks shares one sub-agent instance. The main Agent maps declared names to real agent_ids via `agent_id_map`.
 
 Adding a new task requires only a JSON declaration in `workflow.json`; the engine logic does not change.

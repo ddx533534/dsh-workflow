@@ -1,0 +1,54 @@
+{
+  "version": "1.0",
+  "description": "Hard rules for the verification workflow. The main Agent loads this file at startup and obeys every rule. For sub-agents, the main Agent includes relevant rules in the sub-agent's prompt.",
+  "rules": [
+    {
+      "id": "R001",
+      "target": "main_agent",
+      "rule": "NEED_APPROVAL must be decided by a human. The main Agent must never approve on its own — regardless of how low-risk or trivial the change appears. No auto-approve, no risk-level judgment. The Agent calls --approve ONLY after the user explicitly says yes.",
+      "enforced_by": "engine (won't proceed without --approve/--reject) + documentation (SKILL.md)"
+    },
+    {
+      "id": "R002",
+      "target": "main_agent",
+      "rule": "The main Agent must not touch the repository — no read, no write, no bash, no grep. All repository interaction is done by sub-agents in their own context.",
+      "enforced_by": "documentation (SKILL.md step 5)"
+    },
+    {
+      "id": "R003",
+      "target": "main_agent",
+      "rule": "The main Agent must not read sub-skill SKILL.md files. When executor is set, the Agent passes the ref path to the sub-agent, which reads SKILL.md on its own.",
+      "enforced_by": "documentation (SKILL.md step 3)"
+    },
+    {
+      "id": "R004",
+      "target": "main_agent",
+      "rule": "The main Agent must not read or process sub-agent output content. It only passes file paths. No manual {data:...} wrapping, no intermediate files in artifacts/.",
+      "enforced_by": "documentation (SKILL.md step 3) + engine (processOutput uses outputFilePath directly)"
+    },
+    {
+      "id": "R005",
+      "target": "main_agent",
+      "rule": "The main Agent must not judge sub-agent output quality. It does not decide if code is good, if design is correct, if tests are sufficient. It only relays paths and drives the loop.",
+      "enforced_by": "documentation (SKILL.md step 5)"
+    },
+    {
+      "id": "R008",
+      "target": "main_agent",
+      "rule": "The main Agent must NEVER terminate the loop on its own. When verdict returns passed:false, the Agent must continue --step and let the engine's loop mechanism decide whether to backtrack or exhaust max_iterations. The Agent must NOT read the failure reason and decide 'this is an environment issue, retrying won't help'. That judgment is not the Agent's to make. Even if the failure looks like an environment problem, the Agent must keep driving the loop until the engine itself terminates with max_iterations_exceeded. Short-circuiting the loop is a violation.",
+      "enforced_by": "engine (checkLoops + max_iterations) + documentation (SKILL.md step 4)"
+    },
+    {
+      "id": "R006",
+      "target": "sub_agent",
+      "rule": "Sub-agents must report test results truthfully. Any failure (assertion mismatch, build error, environment missing, timeout) must be marked as failed. No finding excuses for failures.",
+      "enforced_by": "documentation (skills/run_test/SKILL.md + skills/verdict/SKILL.md)"
+    },
+    {
+      "id": "R007",
+      "target": "sub_agent",
+      "rule": "Sub-agents write output directly to artifacts/<task_name>.json or directly to the real repo (for code task). No intermediate files, no _wrapped_ files, no duplicate copies.",
+      "enforced_by": "documentation (README 产出处理) + engine (processOutput records path only)"
+    }
+  ]
+}

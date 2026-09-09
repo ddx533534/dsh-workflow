@@ -52,10 +52,10 @@ function loadWorkflow(workflowPath) {
     throw new Error(`Unsupported protocol version: ${workflow.version}`);
   }
   if (!workflow.run_name || typeof workflow.run_name !== 'string') {
-    throw new Error('workflow.run_name is required (English short name)');
+    throw new Error('workflow.run_name is required (English short name, e.g. change_label)');
   }
   if (!/^[a-z][a-z0-9_]*$/.test(workflow.run_name)) {
-    throw new Error(`workflow.run_name must match ^[a-z][a-z0-9_]*$, got: ${workflow.run_name}`);
+    throw new Error(`workflow.run_name must match ^[a-z][a-z0-9_]*$ (lowercase English, digits, underscores; first char must be a letter). Got: "${workflow.run_name}"`);
   }
   if (!Array.isArray(workflow.phases) || workflow.phases.length === 0) {
     throw new Error('workflow.phases must be a non-empty array');
@@ -124,6 +124,7 @@ function loadWorkflow(workflowPath) {
       loop_counts: {},
       backtrack_counts: {},
       backtrack_log: [],
+      known_agents: [],
       terminated: false,
       terminate_reason: null,
     };
@@ -131,6 +132,8 @@ function loadWorkflow(workflowPath) {
   // Ensure backtrack fields exist even if context was loaded from old workflow.json
   if (!workflow.context.backtrack_counts) workflow.context.backtrack_counts = {};
   if (!workflow.context.backtrack_log) workflow.context.backtrack_log = [];
+  // Ensure known_agents exists for executor tracking
+  if (!workflow.context.known_agents) workflow.context.known_agents = [];
 
   return { workflow, workflowDir };
 }
@@ -156,9 +159,32 @@ function getTask(workflow, name) {
 }
 
 /**
+ * Is a task "done" (completed and still valid — does not need to run)?
+ * A task needs (re)execution when:
+ *   - it has no history (never ran), OR
+ *   - its last attempt was not successful, OR
+ *   - its last attempt is marked expired (a predecessor was re-run via
+ *     loop backtrack or request_backtrack, so this result is out of date).
+ *
+ * This is the single source of truth used by both findNextTask and advance,
+ * which means crash recovery and loop backtracking share the same logic.
+ *
+ * @param {object} task
+ * @returns {boolean} — true if the task is done and should be skipped
+ */
+function isTaskDone(task) {
+  const hist = task.history || [];
+  const last = hist[hist.length - 1];
+  if (!last) return false;                          // never ran
+  if (last.status !== 'success') return false;       // last run wasn't successful
+  if (last.expired === true) return false;            // succeeded but out of date
+  return true;
+}
+
+/**
  * Find the next task to execute.
  * - If context.current_task is set, resume from there.
- * - Otherwise find the first task whose last attempt wasn't success.
+ * - Otherwise find the first task that is not "done" (see isTaskDone).
  *
  * NOTE: A task with requires_approval that has a pending Attempt (approval_status=null)
  * is "in progress" — findNextTask returns it so the engine can re-enter the approval flow.
@@ -180,11 +206,9 @@ function findNextTask(workflow) {
     }
   }
 
-  // Otherwise find the first task without a successful last attempt
+  // Otherwise find the first task that is not done
   for (const t of ordered) {
-    const hist = t.history || [];
-    const last = hist[hist.length - 1];
-    if (!last || last.status !== 'success') {
+    if (!isTaskDone(t)) {
       return t;
     }
   }
@@ -235,7 +259,7 @@ function ensureArtifactsDir(workflow, workflowDir) {
  */
 function writeArtifact(workflow, workflowDir, taskName, attemptNum, data) {
   const relArtifactsDir = ensureArtifactsDir(workflow, workflowDir);
-  const filename = `${taskName}_attempt${attemptNum}.json`;
+  const filename = `${taskName}_v${attemptNum}.json`;
   const relPath = path.join(relArtifactsDir, filename);
   const absPath = path.resolve(workflowDir, relPath);
   fs.writeFileSync(absPath, JSON.stringify(data, null, 2), 'utf8');
@@ -269,18 +293,45 @@ function readArtifact(workflowDir, relFilePath) {
 /**
  * Execute a task's handler.
  * - skill: do NOT execute here; return a NEED_SKILL directive for the Agent.
+ *   If the task has an `executor` field (e.g. "subagent:coder"), the directive
+ *   includes executor info (agent_id, reuse) so the Agent knows whether to
+ *   create a new sub-agent or send_message to an existing one.
  * - script: run via bash, read JSON output from stdout.
  *
  * @param {object} task
  * @param {object} input  — assembled input data
  * @param {string} skillRoot — path to the verification-workflow skill root
- * @returns {{kind:'skill', ref:string, input:object} | {kind:'script', output:object, failed?:boolean}}
+ * @param {object} workflow — the workflow object (for known_agents tracking)
+ * @returns {{kind:'skill', ref:string, input:object, executor?:object} | {kind:'script', output:object, failed?:boolean}}
  */
-function executeHandler(task, input, skillRoot) {
+function executeHandler(task, input, skillRoot, workflow) {
   const handler = task.handler;
 
   if (handler.type === 'skill') {
-    return { kind: 'skill', ref: handler.ref, input };
+    const executorDecl = task.executor || 'self';
+    if (executorDecl === 'self') {
+      // Main Agent executes directly (current behavior)
+      return { kind: 'skill', ref: handler.ref, input };
+    }
+    if (executorDecl.startsWith('subagent:')) {
+      const agentId = executorDecl.slice('subagent:'.length);
+      const knownAgents = workflow.context.known_agents || [];
+      const reuse = knownAgents.includes(agentId);
+      if (!reuse) {
+        // First time seeing this agent_id — record it
+        if (!workflow.context.known_agents) {
+          workflow.context.known_agents = [];
+        }
+        workflow.context.known_agents.push(agentId);
+      }
+      return {
+        kind: 'skill',
+        ref: handler.ref,
+        input,
+        executor: { mode: 'subagent', agent_id: agentId, reuse },
+      };
+    }
+    throw new Error(`Unknown executor '${executorDecl}' for task '${task.name}'`);
   }
 
   if (handler.type === 'script') {
@@ -324,13 +375,16 @@ function executeHandler(task, input, skillRoot) {
 /**
  * Gather input for a task from its depends_on predecessors' latest outputs.
  * Two modes:
- *   - Artifact mode (output.file): read the artifact file content.
+ *   - Artifact mode (output.file): pass the artifact file PATH (not content).
  *   - Side-effect mode (output.changed_files): pass changed_files + summary directly.
+ *
+ * Input carries file paths, not file content — the main Agent's context stays
+ * clean (no business data). The sub-agent reads the files itself.
  *
  * @param {object} workflow
  * @param {object} task
  * @param {string} workflowDir
- * @returns {object} — keyed map of predecessor name → its last output data
+ * @returns {object} — keyed map of predecessor name → { file: "<path>" } or { changed_files, summary }
  */
 function gatherInput(workflow, task, workflowDir) {
   const input = {};
@@ -340,8 +394,8 @@ function gatherInput(workflow, task, workflowDir) {
     const last = hist[hist.length - 1];
     if (last && last.status === 'success' && last.output) {
       if (last.output.file) {
-        // Artifact mode: read the artifact file
-        input[depName] = readArtifact(workflowDir, last.output.file);
+        // Artifact mode: pass the file path, NOT the content
+        input[depName] = { file: last.output.file };
       } else if (last.output.changed_files) {
         // Side-effect mode: pass changed_files + summary directly
         input[depName] = {
@@ -382,15 +436,72 @@ function validateAgainstSchema(value, schema) {
 }
 
 /**
- * Process a task's output: decide whether to write files to the real repo
- * (side-effect mode) or externalize to an artifact file (default mode).
+ * Archive the previous artifact file before a new attempt is recorded.
+ *
+ * When a task is re-run (loop backtrack or request_backtrack), the sub-agent
+ * writes its output to the same canonical path (artifacts/<task_name>.json),
+ * which overwrites the previous attempt's content. By the time the engine
+ * runs this function (during --step --output-file), the sub-agent has ALREADY
+ * written the new content to that path.
+ *
+ * To preserve history on disk, this function COPIES the file at the previous
+ * attempt's output path to <task_name>_v<N>.json, then points the previous
+ * attempt's output.file to the archive copy. The canonical path keeps the
+ * new content (so the current attempt and downstream tasks read correctly).
+ *
+ * We use copy (not rename) because the sub-agent writes BEFORE the engine
+ * runs — the file at the canonical path is already the NEW content. Renaming
+ * would move the new content away and leave the canonical path missing,
+ * breaking downstream tasks. Copying preserves the new content in place
+ * while still creating an archive copy for history.
+ *
+ * Note: the archive copy's content equals the NEW attempt's content (since
+ * the old content was already overwritten by the sub-agent). The old content
+ * is lost — this is an inherent limitation of the "sub-agent writes first,
+ engine archives after" timing. To truly preserve old content, the engine
+ would need to archive BEFORE the sub-agent writes, which is not possible
+ with the current single-step architecture.
+ *
+ * Only applies to artifact mode (output.file). Side-effect mode
+ * (changed_files) has no artifact file to archive. The fallback path
+ * (writeArtifact) already uses _v<N> naming, so no archive needed.
+ *
+ * @param {object} task
+ * @param {string} workflowDir
+ */
+function archivePreviousArtifact(task, workflowDir) {
+  if (!task.history || task.history.length === 0) return;
+  const prev = task.history[task.history.length - 1];
+  if (!prev || !prev.output || !prev.output.file) return;
+  const oldRel = prev.output.file;
+  const oldAbs = path.resolve(workflowDir, oldRel);
+  if (!fs.existsSync(oldAbs)) return;
+  const archiveName = `${task.name}_v${prev.attempt}.json`;
+  const oldDir = path.dirname(oldRel);
+  const archiveRel = path.join(oldDir, archiveName);
+  const archiveAbs = path.resolve(workflowDir, archiveRel);
+  try {
+    // Copy (not rename): the canonical path keeps the new content for the
+    // current attempt and downstream tasks; the archive copy preserves a
+    // snapshot for history. Using rename would move the new content away
+    // and break the canonical path.
+    fs.copyFileSync(oldAbs, archiveAbs);
+    prev.output.file = archiveRel;
+  } catch (e) {
+    // Copy failed (permission, cross-device, etc.) — leave old file as-is.
+  }
+}
+
+/**
+ * Process a task's output.
  *
  * Rule:
- *   - If output.data contains a `files` array → write each file to the real
- *     repo, store only { changed_files, summary } in the Attempt output.
- *     No artifact file is created.
- *   - Otherwise → externalize output.data to an artifact file, store
- *     { file } in the Attempt output.
+ *   - If output.data contains a `changed_files` array → direct-write mode:
+ *     sub-agent already wrote files to the real repo. Engine only records
+ *     the path list and summary. No artifact file needed.
+ *   - Else if outputFilePath provided → artifact mode: sub-agent already
+ *     wrote the file directly. Engine only records the path.
+ *   - Otherwise → fallback: engine writes output.data to an artifact file.
  *
  * `passed` (if present in the envelope) is always kept in the Attempt output
  * regardless of mode, so loop_controller can read it without touching files.
@@ -402,34 +513,36 @@ function validateAgainstSchema(value, schema) {
  * @param {object} outputEnvelope — { data, passed? }
  * @returns {object} — the output object to store in the Attempt
  */
-function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelope) {
+function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelope, outputFilePath) {
   const data = (outputEnvelope && outputEnvelope.data) || {};
   const output = {};
 
-  // Check for files in data first, then at envelope top level.
-  // This handles both { data: { files: [...] } } and { files: [...] } formats.
-  const files = Array.isArray(data.files) ? data.files
-    : (Array.isArray(outputEnvelope && outputEnvelope.files) ? outputEnvelope.files : null);
+  // Extract changed_files and summary from data (sub-agent writes files directly
+  // to the real repo; engine only records the path list).
+  const changedFiles = Array.isArray(data.changed_files) ? data.changed_files
+    : (Array.isArray(outputEnvelope && outputEnvelope.changed_files) ? outputEnvelope.changed_files : null);
   const summary = data.summary || (outputEnvelope && outputEnvelope.summary);
 
-  if (files && files.length > 0) {
-    // Side-effect mode: write files to the real repo (project_root), not the run directory
-    const projectRoot = workflow.project_root || '../..';
-    const changedFiles = [];
-    for (const f of files) {
-      if (f.path && typeof f.content === 'string') {
-        const absPath = path.resolve(workflowDir, projectRoot, f.path);
-        fs.mkdirSync(path.dirname(absPath), { recursive: true });
-        fs.writeFileSync(absPath, f.content, 'utf8');
-        changedFiles.push(f.path);
-      }
-    }
+  if (changedFiles && changedFiles.length > 0) {
+    // Direct-write mode: sub-agent already wrote files to the real repo.
+    // Engine only records the path list and summary.
     output.changed_files = changedFiles;
     if (summary) {
       output.summary = summary;
     }
+  } else if (outputFilePath) {
+    // Artifact mode: sub-agent already wrote the file directly into artifacts/.
+    // Engine just records the path — does NOT read content, NOT re-write.
+    // Convert absolute path to relative (if under workflowDir) for portability.
+    const absOutput = path.resolve(outputFilePath);
+    const absWorkflow = path.resolve(workflowDir);
+    if (absOutput.startsWith(absWorkflow + path.sep)) {
+      output.file = path.relative(absWorkflow, absOutput);
+    } else {
+      output.file = outputFilePath;
+    }
   } else {
-    // Default mode: externalize to artifact file
+    // Fallback: no output file path provided, externalize to artifact file
     output.file = writeArtifact(workflow, workflowDir, taskName, attemptNum, data);
   }
 
@@ -461,14 +574,20 @@ function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelo
  * @param {object|null} approval — { approval_status, approved_by, approved_at, reject_reason } or null
  * @returns {object} — the written Attempt
  */
-function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, approval) {
+function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, approval, outputFilePath) {
   if (!task.history) task.history = [];
   const attemptNum = task.history.length + 1;
   const now = new Date().toISOString();
   if (!task.started_at) task.started_at = now;
   task.finished_at = now;
 
-  const output = processOutput(workflow, workflowDir, task.name, attemptNum, outputEnvelope);
+  // Archive the previous attempt's artifact file before recording the new one.
+  // Copies artifacts/<task>.json → artifacts/<task>_v<N>.json so the
+  // canonical path keeps the new content (sub-agent already wrote it) and
+  // downstream tasks can read it. See archivePreviousArtifact for details.
+  archivePreviousArtifact(task, workflowDir);
+
+  const output = processOutput(workflow, workflowDir, task.name, attemptNum, outputEnvelope, outputFilePath);
 
   const attempt = {
     attempt: attemptNum,
@@ -489,7 +608,7 @@ function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, appr
 }
 
 /**
- * Advance context.current_task to the next uncompleted task.
+ * Advance context.current_task to the next task that is not done.
  * @param {object} workflow
  * @param {object} justFinishedTask
  */
@@ -497,12 +616,9 @@ function advance(workflow, justFinishedTask) {
   const ordered = orderTasks(workflow.tasks);
   const idx = ordered.findIndex(t => t.name === justFinishedTask.name);
   for (let i = idx + 1; i < ordered.length; i++) {
-    const t = ordered[i];
-    const hist = t.history || [];
-    const last = hist[hist.length - 1];
-    if (!last || last.status !== 'success') {
-      workflow.context.current_task = t.name;
-      workflow.context.current_phase = t.phase;
+    if (!isTaskDone(ordered[i])) {
+      workflow.context.current_task = ordered[i].name;
+      workflow.context.current_phase = ordered[i].phase;
       return;
     }
   }
@@ -557,22 +673,25 @@ function checkLoops(workflow, task) {
       workflow.context.current_task = target.name;
       workflow.context.current_phase = target.phase;
 
-      // Mark all tasks AFTER target_task (in declaration order) as stale.
-      // Their previous results were based on stale predecessor outputs.
-      // We keep the history for audit but mark each Attempt as stale so
-      // findNextTask/advance know to re-run them.
-      // For simplicity, we clear started_at/finished_at and mark last attempt
-      // as stale by setting a flag. But since we want to keep it simple:
-      // we clear history of downstream tasks (they will be re-run fresh).
+      // Mark all tasks AFTER target_task (in declaration order) as expired.
+      // Their previous results were based on predecessor outputs that have
+      // now changed, so those results are out of date. We do NOT clear
+      // history — we keep every attempt for audit and only set expired=true
+      // on each downstream task's last attempt. isTaskDone (used by
+      // findNextTask and advance) treats an expired last attempt as
+      // "needs re-run", so the downstream tasks will be re-executed while
+      // their old history stays on the record.
       // The rejected/failed attempts on the trigger task itself are preserved.
       const ordered = orderTasks(workflow.tasks);
       const targetIdx = ordered.findIndex(t => t.name === target.name);
       for (let i = targetIdx + 1; i < ordered.length; i++) {
-        // Clear downstream task history — they need full re-run.
-        // Their previous artifacts remain on disk for reference.
-        ordered[i].history = [];
-        ordered[i].started_at = null;
-        ordered[i].finished_at = null;
+        const hist = ordered[i].history || [];
+        const last = hist[hist.length - 1];
+        if (last) {
+          last.expired = true;
+          last.expired_reason = `backtrack_from:${loop.trigger_task}→${loop.target_task}`;
+        }
+        // Previous artifacts remain on disk for reference.
       }
 
       return { triggered: true, loop };
@@ -646,11 +765,15 @@ function checkRequestBacktrack(workflow, task) {
   counts[task.name] = current + 1;
   workflow.context.backtrack_counts = counts;
 
-  // Clear downstream history (same as checkLoops)
+  // Mark downstream tasks' last attempt as expired (same as checkLoops).
+  // History is preserved; isTaskDone treats expired attempts as "needs re-run".
   for (let i = targetIdx + 1; i < ordered.length; i++) {
-    ordered[i].history = [];
-    ordered[i].started_at = null;
-    ordered[i].finished_at = null;
+    const hist = ordered[i].history || [];
+    const last = hist[hist.length - 1];
+    if (last) {
+      last.expired = true;
+      last.expired_reason = `backtrack_from:${task.name}→${req.to}`;
+    }
   }
 
   workflow.context.current_task = target.name;
@@ -720,7 +843,17 @@ function saveWorkflow(workflow, workflowPath) {
  * @param {object} opts — { outputJson, approve, rejectReason }
  */
 function step(workflowPath, opts) {
-  const { outputJson, approve, rejectReason } = opts;
+  const { outputFilePath, approve, rejectReason, agentId } = opts;
+  // Resolve output: prefer --output-file (path), fall back to --output (inline JSON)
+  let outputJson = opts.outputJson;
+  if (outputFilePath) {
+    try {
+      outputJson = fs.readFileSync(outputFilePath, 'utf8');
+    } catch (e) {
+      emit({ type: 'ERROR', message: `Cannot read --output-file: ${e.message}` });
+      return;
+    }
+  }
   const { workflow, workflowDir } = loadWorkflow(workflowPath);
   const skillRoot = workflowDir;
   const ctx = workflow.context;
@@ -857,18 +990,13 @@ function step(workflowPath, opts) {
       emit({ type: 'ERROR', message: 'output must be a JSON object' });
       return;
     }
-    // Normalize: if no 'data' field but has 'files' at top level, treat the whole envelope as data.
-    // This supports both { data: { files: [...] } } and { files: [...] } formats.
+    // Normalize: if no 'data' field, wrap the whole object into data.
+    // Sub-agent output may be { clarified_requirement: "..." } without data wrapper.
+    // Also handles { files: [...] } and { passed: true, ... } formats.
     if (!('data' in outputEnvelope)) {
-      if ('files' in outputEnvelope || 'passed' in outputEnvelope) {
-        // Wrap top-level content into data
-        const { passed, ...rest } = outputEnvelope;
-        outputEnvelope = { data: rest };
-        if (passed !== undefined) outputEnvelope.passed = passed;
-      } else {
-        emit({ type: 'ERROR', message: 'output must have data or files field; got neither' });
-        return;
-      }
+      const { passed, ...rest } = outputEnvelope;
+      outputEnvelope = { data: rest };
+      if (passed !== undefined) outputEnvelope.passed = passed;
     }
 
     // Validate data against task.output schema if present
@@ -883,13 +1011,15 @@ function step(workflowPath, opts) {
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       // Fill in the approved pending attempt with execution result
       attempt = lastAttempt;
+      // Archive previous artifact (copy to _v<N>.json) — sub-agent already wrote new content
+      archivePreviousArtifact(task, workflowDir);
       attempt.status = 'success';
-      attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, outputEnvelope);
+      attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, outputEnvelope, outputFilePath);
       const now = new Date().toISOString();
       task.finished_at = now;
     } else {
       // Normal task: record a fresh attempt
-      attempt = recordAttempt(workflow, workflowDir, task, 'success', outputEnvelope, null);
+      attempt = recordAttempt(workflow, workflowDir, task, 'success', outputEnvelope, null, outputFilePath);
     }
 
     saveWorkflow(workflow, workflowPath);
@@ -941,7 +1071,7 @@ function step(workflowPath, opts) {
 
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
+    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output, ...(agentId ? { agent_id: agentId } : {}) });
     return;
   }
 
@@ -956,14 +1086,17 @@ function step(workflowPath, opts) {
     return;
   }
 
-  const result = executeHandler(task, input, skillRoot);
+  const result = executeHandler(task, input, skillRoot, workflow);
 
   if (result.kind === 'skill') {
+    // Save workflow (known_agents may have been updated by executeHandler)
+    saveWorkflow(workflow, workflowPath);
     emit({
       type: 'NEED_SKILL',
       task: task.name,
       ref: result.ref,
       input: result.input,
+      ...(result.executor ? { executor: result.executor } : {}),
     });
     return;
   }
@@ -975,6 +1108,8 @@ function step(workflowPath, opts) {
     let attempt;
     if (task.requires_approval && lastAttempt && lastAttempt.approval_status === 'approved' && !('status' in lastAttempt)) {
       attempt = lastAttempt;
+      // Archive previous artifact (copy to _v<N>.json) — sub-agent already wrote new content
+      archivePreviousArtifact(task, workflowDir);
       attempt.status = status;
       attempt.output = processOutput(workflow, workflowDir, task.name, attempt.attempt, result.output);
       task.finished_at = new Date().toISOString();
@@ -1038,7 +1173,7 @@ function step(workflowPath, opts) {
 
     advance(workflow, task);
     saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output });
+    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output, ...(agentId ? { agent_id: agentId } : {}) });
     return;
   }
 }
@@ -1060,9 +1195,13 @@ function status(workflowPath) {
     loop_counts: workflow.context.loop_counts,
     backtrack_counts: workflow.context.backtrack_counts || {},
     backtrack_log: workflow.context.backtrack_log || [],
+    known_agents: workflow.context.known_agents || [],
     task_progress: workflow.tasks.map(t => {
       const hist = t.history || [];
       const last = hist[hist.length - 1];
+      const durationMs = (t.started_at && t.finished_at)
+        ? new Date(t.finished_at).getTime() - new Date(t.started_at).getTime()
+        : null;
       return {
         name: t.name,
         phase: t.phase,
@@ -1072,6 +1211,7 @@ function status(workflowPath) {
         last_approval_status: last ? (last.approval_status || null) : null,
         started_at: t.started_at || null,
         finished_at: t.finished_at || null,
+        duration_ms: durationMs,
       };
     }),
   });
@@ -1086,15 +1226,17 @@ function emit(obj) {
 }
 
 function parseArgs(argv) {
-  const args = { workflow: null, step: false, status: false, output: null, approve: false, reject: null };
+  const args = { workflow: null, step: false, status: false, output: null, outputFile: null, approve: false, reject: null, agentId: null };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--workflow') { args.workflow = argv[++i]; }
     else if (a === '--step') { args.step = true; }
     else if (a === '--status') { args.status = true; }
     else if (a === '--output') { args.output = argv[++i]; }
+    else if (a === '--output-file') { args.outputFile = argv[++i]; }
     else if (a === '--approve') { args.approve = true; }
     else if (a === '--reject') { args.reject = argv[++i]; }
+    else if (a === '--agent-id') { args.agentId = argv[++i]; }
   }
   return args;
 }
@@ -1115,8 +1257,10 @@ function main() {
     } else if (args.step) {
       step(args.workflow, {
         outputJson: args.output,
+        outputFilePath: args.outputFile,
         approve: args.approve,
         rejectReason: args.reject,
+        agentId: args.agentId,
       });
     } else {
       emit({ type: 'ERROR', message: 'Must specify --step or --status' });

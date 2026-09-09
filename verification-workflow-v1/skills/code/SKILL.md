@@ -13,24 +13,17 @@ input:
   required: [tech_design, test_case_design]
 output:
   type: object
-  description: Files to write into the real repository. The engine will write these files to disk; only changed file paths and summary are stored in the Attempt.
+  description: List of changed files and a summary. The sub-agent writes files directly to the real repository using its own tools; the engine does NOT handle file writing. Only the list of changed paths and summary are stored in the Attempt.
   properties:
-    files:
+    changed_files:
       type: array
       items:
-        type: object
-        properties:
-          path:
-            type: string
-            description: Relative path from the project root (where workflow.json lives).
-          content:
-            type: string
-            description: Full file content to write.
-        required: [path, content]
+        type: string
+        description: Relative path from the project root of each file written/modified.
     summary:
       type: string
       description: Brief summary of what was implemented.
-  required: [files, summary]
+  required: [changed_files, summary]
 ---
 
 # Code Implementation
@@ -41,9 +34,7 @@ You are a software engineer. Given a technical design and test cases, implement 
 
 ## How files are written
 
-**The engine automatically writes your output `files` into the real repository.** You do not need to write files yourself — just declare what files should exist and their full content. The engine handles the actual write to disk.
-
-After writing, the engine stores only the list of changed file paths and your summary in the workflow state. The next task (code_review) will read these files from the real repository.
+**You write files directly to the real repository using your own tools** (write, edit, bash). The engine does NOT handle file writing — you are responsible for writing code to disk yourself. After writing, you only report the list of changed file paths and a summary in your output. The next task (code_review) will read these files from the real repository.
 
 ## Input
 
@@ -63,26 +54,25 @@ This ensures your code fits the real project, not a hypothetical one.
 1. Read the design and test cases.
 2. Examine the real repository to understand existing code and structure.
 3. Implement each component, ensuring the code can pass the test cases.
-4. Produce a list of files with their full content.
-5. Write a brief implementation summary.
+4. **Write the code files directly to the real repository** using your tools (write, edit, bash).
+5. Report the list of changed file paths and a brief implementation summary.
 
 ## Output
 
-Return JSON with `files` (the engine will write these to the real repo) and `summary`:
+Write your output to `artifacts/code.json` with `changed_files` and `summary`:
 
 ```json
 {
-  "files": [
-    { "path": "src/foo.js", "content": "..." }
-  ],
+  "changed_files": ["src/foo.js", "src/bar.js"],
   "summary": "Implemented X, Y, Z..."
 }
 ```
 
-- `files.path` is relative to the project root (where workflow.json lives).
-- `files.content` is the **full** file content — the engine overwrites the file entirely.
+- `changed_files` is a list of file paths you wrote/modified (relative to project root).
+- You are responsible for writing the actual file content to disk using your own tools.
+- The engine does NOT read or handle file content — it only records the path list.
 - Do not include a `passed` field.
-- Do not wrap in `{ data: ... }` — return content directly; the engine handles wrapping.
+- Do not wrap in `{ data: ... }` — the engine handles wrapping if needed.
 
 
 ## request_backtrack (optional)
