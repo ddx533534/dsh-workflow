@@ -42,6 +42,7 @@
 - [目录结构](#目录结构)
 - [硬规则](#硬规则rulesjson)
 - [协议规范](#协议规范)
+- [阶段输入输出契约](#阶段输入输出契约)
 - [执行模型](#执行模型)
 - [回环与审批](#回环与审批)
 - [产出处理](#产出处理)
@@ -199,7 +200,20 @@ verification-workflow-v1/
 { "name": "plan", "tasks": ["requirement_clarification", "tech_design", "test_case_design"] }
 ```
 
-`name` 不是固定枚举，可扩展（将来可加 `deploy`）。
+`phase` 是工作流中的一级阶段，用于对 task 分组和表达研发生命周期，本身不直接执行逻辑：
+
+- `name`：阶段标识，例如 `plan`、`code`、`verify`；不是固定枚举，可扩展为 `deploy`、`release` 等。
+- `tasks`：属于该阶段的 task 名称列表，按阶段内的逻辑顺序排列。
+
+当前版本的阶段定义：
+
+| phase | 定义 | 目标 |
+|---|---|---|
+| `plan` | 需求到可执行方案的规划阶段 | 明确需求、设计方案、定义测试 |
+| `code` | 方案落地阶段 | 修改代码并完成代码评审 |
+| `verify` | 结果验证阶段 | 执行测试并形成最终判定 |
+
+`phase` 是组织和路由概念，真正驱动状态转移的是 task 及其依赖关系。一个 phase 可以包含多个串行 task，未来也可以承载并行 task。
 
 ### Task
 
@@ -215,9 +229,9 @@ verification-workflow-v1/
 
 | 字段 | 说明 |
 |---|---|
-| `name` | 全局唯一，与 `phase` 联合标识。 |
+| `name` | 全局唯一的 task 标识；与 `phase` 形成归属关系。 |
 | `handler` | `{ type: "skill"\|"script", ref }`。ref 是相对路径。 |
-| `executor` | 默认 `self`（主 Agent 自己执行）。`subagent:<agent_id>` = 起子 Agent 执行，同 agent_id 跨 task 复用。 |
+| `executor` | 默认 `self`（主 Agent 自己执行）。`subagent:<name>` = 由指定子 Agent 执行，同声明名跨 task 复用。 |
 | `depends_on` | 前置 task 列表，声明串行顺序。 |
 | `requires_approval` | 默认 false。true = 执行前必须人工审批。 |
 | `input`/`output` | JSON Schema 契约，可选。子 skill 可自声明。 |
@@ -240,8 +254,8 @@ verification-workflow-v1/
 
 | 模式 | output 字段 | 何时 |
 |---|---|---|
-| artifact | `file` | 产出无 `files` 字段（默认） |
-| side-effect | `changed_files`, `summary` | 产出含 `files` 字段（如 code task） |
+| artifact | `file` | 产出无 `changed_files` 字段（默认） |
+| side-effect | `changed_files`, `summary` | 产出含 `changed_files` 字段（如 code task） |
 
 **input 传文件路径，不传内容。** 引擎的 `gatherInput` 收集前序 task 的产出时，artifact 模式只传 `{ file: "artifacts/xxx.json" }`（路径），side-effect 模式传 `{ changed_files, summary }`。主 Agent 和子 Agent 拿到路径后自己 `read` 文件内容——主 Agent 上下文里没有业务数据。
 
@@ -286,6 +300,28 @@ verification-workflow-v1/
   "terminate_reason": null
 }
 ```
+
+---
+
+## 阶段输入输出契约
+
+阶段级别不直接传递业务数据；数据通过阶段内的 task 产出和 `depends_on` 传递。下面的“阶段输入/输出”是当前默认流程的边界契约：
+
+| 阶段 | 输入 | 输出 | 主要产物 |
+|---|---|---|---|
+| `plan` | 用户原始需求，以及前序规划 task 的 artifact 路径 | 澄清后的需求、技术方案、测试用例 | `requirement_clarification.json`、`tech_design.json`、`test_case_design.json` |
+| `code` | 需求相关设计和测试设计的 artifact 路径；评审 task 额外读取真实仓库 | 真实仓库的代码变更，或代码评审意见 | 代码文件；`code_review.json` |
+| `verify` | 测试用例 artifact 路径；判定 task 读取测试结果 artifact | 测试结果和最终 `passed` 判定 | `run_test.json`、`verdict.json` |
+
+### task 的输入输出约定
+
+- artifact 类型输入只传文件路径，例如 `{ "tech_design": { "file": "artifacts/tech_design.json" } }`；执行 Agent 负责读取文件内容。
+- side-effect 类型输入传 `{ "changed_files": [...], "summary": "..." }`；执行 Agent 负责从真实仓库读取文件。
+- 普通规划、评审、测试和判定 task 输出结构化 JSON，并写入对应 artifact 文件。
+- `code` task 输出 `changed_files` 和 `summary`，代码本体直接写入真实仓库。
+- 只有 `verdict` task 的输出需要携带 `passed`，它是引擎回环控制的机器字段。
+
+各 task 的完整 JSON 示例和字段要求见下方[各阶段输入输出详解](#各阶段输入输出详解)。
 
 ---
 
