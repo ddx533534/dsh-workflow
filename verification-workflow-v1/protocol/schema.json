@@ -103,6 +103,11 @@
           "default": false,
           "description": "If true, the engine pauses before executing this task and waits for human approval. Re-checked on every loop re-run."
         },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1000,
+          "description": "Optional. Maximum wall-clock duration for one attempt (milliseconds). The engine reports stuck_duration_ms in --status; the main Agent can use it to interrupt a stuck sub-agent. Not enforced by the engine directly — it's advisory for the Agent's timeout logic."
+        },
         "executor": {
           "type": "string",
           "default": "self",
@@ -275,6 +280,10 @@
         "current_task": {
           "type": "string",
           "description": "The task currently being executed, or null if finished."
+        },
+        "user_requirement": {
+          "type": ["string", "null"],
+          "description": "The original user requirement text. Set by the Agent when generating workflow.json. Injected by gatherInput into root tasks (depends_on=[]) as input.raw_requirement."
         },
         "loop_counts": {
           "type": "object",

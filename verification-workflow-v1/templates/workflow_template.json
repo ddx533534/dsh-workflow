@@ -110,6 +110,7 @@
   "context": {
     "current_phase": null,
     "current_task": null,
+    "user_requirement": null,
     "loop_counts": {},
     "backtrack_counts": {},
     "backtrack_log": [],

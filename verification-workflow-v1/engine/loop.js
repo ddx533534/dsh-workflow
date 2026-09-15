@@ -125,6 +125,7 @@ function loadWorkflow(workflowPath) {
       backtrack_counts: {},
       backtrack_log: [],
       known_agents: [],
+      user_requirement: null,
       terminated: false,
       terminate_reason: null,
     };
@@ -136,16 +137,6 @@ function loadWorkflow(workflowPath) {
   if (!workflow.context.known_agents) workflow.context.known_agents = [];
 
   return { workflow, workflowDir };
-}
-
-/**
- * Topologically order tasks by depends_on (serial execution).
- * Falls back to declaration order when no dependency constraints.
- * @param {object[]} tasks
- * @returns {object[]}
- */
-function orderTasks(tasks) {
-  return tasks;
 }
 
 /**
@@ -196,7 +187,7 @@ function findNextTask(workflow) {
   const ctx = workflow.context;
   if (ctx.terminated) return null;
 
-  const ordered = orderTasks(workflow.tasks);
+  const ordered = workflow.tasks;
 
   // If current_task is set, resume from it
   if (ctx.current_task) {
@@ -388,6 +379,14 @@ function executeHandler(task, input, skillRoot, workflow) {
  */
 function gatherInput(workflow, task, workflowDir) {
   const input = {};
+
+  // For root tasks (no depends_on), inject the user_requirement from context
+  // so the sub-agent receives it as a structured input field rather than
+  // relying solely on the main Agent's prompt assembly.
+  if ((!task.depends_on || task.depends_on.length === 0) && workflow.context && workflow.context.user_requirement) {
+    input.raw_requirement = workflow.context.user_requirement;
+  }
+
   for (const depName of (task.depends_on || [])) {
     const dep = getTask(workflow, depName);
     const hist = (dep && dep.history) || [];
@@ -474,6 +473,10 @@ function archivePreviousArtifact(task, workflowDir) {
   const prev = task.history[task.history.length - 1];
   if (!prev || !prev.output || !prev.output.file) return;
   const oldRel = prev.output.file;
+
+  // Idempotency: if already pointing to a _v<N> archive, skip.
+  if (/_v\d+\.json$/.test(oldRel)) return;
+
   const oldAbs = path.resolve(workflowDir, oldRel);
   if (!fs.existsSync(oldAbs)) return;
   const archiveName = `${task.name}_v${prev.attempt}.json`;
@@ -481,14 +484,13 @@ function archivePreviousArtifact(task, workflowDir) {
   const archiveRel = path.join(oldDir, archiveName);
   const archiveAbs = path.resolve(workflowDir, archiveRel);
   try {
-    // Copy (not rename): the canonical path keeps the new content for the
-    // current attempt and downstream tasks; the archive copy preserves a
-    // snapshot for history. Using rename would move the new content away
-    // and break the canonical path.
-    fs.copyFileSync(oldAbs, archiveAbs);
+    // Rename: moves old content to archive, leaves canonical path empty
+    // for the sub-agent to write fresh content. Safe because archiving
+    // happens BEFORE the sub-agent writes (at NEED_SKILL time).
+    fs.renameSync(oldAbs, archiveAbs);
     prev.output.file = archiveRel;
   } catch (e) {
-    // Copy failed (permission, cross-device, etc.) — leave old file as-is.
+    // Rename failed — leave old file as-is.
   }
 }
 
@@ -519,8 +521,12 @@ function processOutput(workflow, workflowDir, taskName, attemptNum, outputEnvelo
 
   // Extract changed_files and summary from data (sub-agent writes files directly
   // to the real repo; engine only records the path list).
+  // Accept both `changed_files` (canonical) and `files` (common shorthand) as
+  // fallback — sub-agents sometimes use the shorter name.
   const changedFiles = Array.isArray(data.changed_files) ? data.changed_files
-    : (Array.isArray(outputEnvelope && outputEnvelope.changed_files) ? outputEnvelope.changed_files : null);
+    : Array.isArray(data.files) ? data.files
+    : (Array.isArray(outputEnvelope && outputEnvelope.changed_files) ? outputEnvelope.changed_files
+    : (Array.isArray(outputEnvelope && outputEnvelope.files) ? outputEnvelope.files : null));
   const summary = data.summary || (outputEnvelope && outputEnvelope.summary);
 
   if (changedFiles && changedFiles.length > 0) {
@@ -613,7 +619,7 @@ function recordAttempt(workflow, workflowDir, task, status, outputEnvelope, appr
  * @param {object} justFinishedTask
  */
 function advance(workflow, justFinishedTask) {
-  const ordered = orderTasks(workflow.tasks);
+  const ordered = workflow.tasks;
   const idx = ordered.findIndex(t => t.name === justFinishedTask.name);
   for (let i = idx + 1; i < ordered.length; i++) {
     if (!isTaskDone(ordered[i])) {
@@ -682,7 +688,7 @@ function checkLoops(workflow, task) {
       // "needs re-run", so the downstream tasks will be re-executed while
       // their old history stays on the record.
       // The rejected/failed attempts on the trigger task itself are preserved.
-      const ordered = orderTasks(workflow.tasks);
+      const ordered = workflow.tasks;
       const targetIdx = ordered.findIndex(t => t.name === target.name);
       for (let i = targetIdx + 1; i < ordered.length; i++) {
         const hist = ordered[i].history || [];
@@ -744,7 +750,7 @@ function checkRequestBacktrack(workflow, task) {
   }
 
   // 2. Validate target is a predecessor (only allow backward jumps)
-  const ordered = orderTasks(workflow.tasks);
+  const ordered = workflow.tasks;
   const currentIdx = ordered.findIndex(t => t.name === task.name);
   const targetIdx = ordered.findIndex(t => t.name === req.to);
   if (targetIdx >= currentIdx) {
@@ -817,6 +823,75 @@ function saveWorkflow(workflow, workflowPath) {
   const tmp = workflowPath + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(workflow, null, 2), 'utf8');
   fs.renameSync(tmp, workflowPath);
+}
+
+/**
+ * Post-task settlement: check loops, check request_backtrack, advance, emit.
+ * Shared by output-feedback mode (skill --output-file) and script execution
+ * mode — both need the same loop/backtrack/advance/DONE sequence after a
+ * task produces its result.
+ *
+ * @param {object} workflow
+ * @param {string} workflowPath
+ * @param {object} task — the task that just finished
+ * @param {object} attempt — the recorded attempt
+ * @param {string|null} agentId — optional real agent_id for log verification
+ * @returns {boolean} — true if the engine emitted and returned (caller should
+ *   return); false if settlement continued to advance and the caller should
+ *   not double-emit.
+ */
+function postTaskSettlement(workflow, workflowPath, task, attempt, agentId) {
+  const ctx = workflow.context;
+
+  // Check loops (declaration-driven)
+  const loopResult = checkLoops(workflow, task);
+  if (loopResult.exhausted) {
+    ctx.terminated = true;
+    ctx.terminate_reason = `max_iterations_exceeded: ${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`;
+    saveWorkflow(workflow, workflowPath);
+    emit({ type: 'TERMINATED', reason: ctx.terminate_reason });
+    return true;
+  }
+  if (loopResult.triggered) {
+    saveWorkflow(workflow, workflowPath);
+    emit({
+      type: 'LOOP_BACK',
+      from: task.name,
+      to: loopResult.loop.target_task,
+      iteration: workflow.context.loop_counts[`${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`],
+      max: loopResult.loop.max_iterations,
+    });
+    return true;
+  }
+
+  // Check request_backtrack (LLM-initiated, after loops didn't trigger)
+  const btResult = checkRequestBacktrack(workflow, task);
+  if (btResult.triggered) {
+    saveWorkflow(workflow, workflowPath);
+    emit({
+      type: 'BACKTRACK',
+      from: btResult.from,
+      to: btResult.to,
+      reason: btResult.reason,
+      iteration: btResult.iteration,
+      max: btResult.max,
+    });
+    return true;
+  }
+  if (btResult.ignored || btResult.exhausted) {
+    saveWorkflow(workflow, workflowPath);
+    emit({
+      type: 'BACKTRACK_IGNORED',
+      from: task.name,
+      reason: btResult.reason,
+    });
+    // Continue to advance (request ignored, normal flow)
+  }
+
+  advance(workflow, task);
+  saveWorkflow(workflow, workflowPath);
+  emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output, ...(agentId ? { agent_id: agentId } : {}) });
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1024,54 +1099,7 @@ function step(workflowPath, opts) {
 
     saveWorkflow(workflow, workflowPath);
 
-    // Check loops
-    const loopResult = checkLoops(workflow, task);
-    if (loopResult.exhausted) {
-      ctx.terminated = true;
-      ctx.terminate_reason = `max_iterations_exceeded: ${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`;
-      saveWorkflow(workflow, workflowPath);
-      emit({ type: 'TERMINATED', reason: ctx.terminate_reason });
-      return;
-    }
-    if (loopResult.triggered) {
-      saveWorkflow(workflow, workflowPath);
-      emit({
-        type: 'LOOP_BACK',
-        from: task.name,
-        to: loopResult.loop.target_task,
-        iteration: workflow.context.loop_counts[`${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`],
-        max: loopResult.loop.max_iterations,
-      });
-      return;
-    }
-
-    // Check request_backtrack (LLM-initiated, after loops didn't trigger)
-    const btResult = checkRequestBacktrack(workflow, task);
-    if (btResult.triggered) {
-      saveWorkflow(workflow, workflowPath);
-      emit({
-        type: 'BACKTRACK',
-        from: btResult.from,
-        to: btResult.to,
-        reason: btResult.reason,
-        iteration: btResult.iteration,
-        max: btResult.max,
-      });
-      return;
-    }
-    if (btResult.ignored || btResult.exhausted) {
-      saveWorkflow(workflow, workflowPath);
-      emit({
-        type: 'BACKTRACK_IGNORED',
-        from: task.name,
-        reason: btResult.reason,
-      });
-      // Continue to advance (request ignored, normal flow)
-    }
-
-    advance(workflow, task);
-    saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output, ...(agentId ? { agent_id: agentId } : {}) });
+    postTaskSettlement(workflow, workflowPath, task, attempt, agentId);
     return;
   }
 
@@ -1089,7 +1117,10 @@ function step(workflowPath, opts) {
   const result = executeHandler(task, input, skillRoot, workflow);
 
   if (result.kind === 'skill') {
-    // Save workflow (known_agents may have been updated by executeHandler)
+    // Pre-write archiving: if this task has a previous attempt (re-run via
+    // loop/backtrack), archive the old artifact NOW — before the sub-agent
+    // overwrites the canonical path. Idempotent: no-op if already archived.
+    archivePreviousArtifact(task, workflowDir);
     saveWorkflow(workflow, workflowPath);
     emit({
       type: 'NEED_SKILL',
@@ -1127,53 +1158,7 @@ function step(workflowPath, opts) {
       return;
     }
 
-    const loopResult = checkLoops(workflow, task);
-    if (loopResult.exhausted) {
-      ctx.terminated = true;
-      ctx.terminate_reason = `max_iterations_exceeded: ${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`;
-      saveWorkflow(workflow, workflowPath);
-      emit({ type: 'TERMINATED', reason: ctx.terminate_reason });
-      return;
-    }
-    if (loopResult.triggered) {
-      saveWorkflow(workflow, workflowPath);
-      emit({
-        type: 'LOOP_BACK',
-        from: task.name,
-        to: loopResult.loop.target_task,
-        iteration: workflow.context.loop_counts[`${loopResult.loop.trigger_task}→${loopResult.loop.target_task}`],
-        max: loopResult.loop.max_iterations,
-      });
-      return;
-    }
-
-    // Check request_backtrack (LLM-initiated, after loops didn't trigger)
-    const btResult = checkRequestBacktrack(workflow, task);
-    if (btResult.triggered) {
-      saveWorkflow(workflow, workflowPath);
-      emit({
-        type: 'BACKTRACK',
-        from: btResult.from,
-        to: btResult.to,
-        reason: btResult.reason,
-        iteration: btResult.iteration,
-        max: btResult.max,
-      });
-      return;
-    }
-    if (btResult.ignored || btResult.exhausted) {
-      saveWorkflow(workflow, workflowPath);
-      emit({
-        type: 'BACKTRACK_IGNORED',
-        from: task.name,
-        reason: btResult.reason,
-      });
-      // Continue to advance (request ignored, normal flow)
-    }
-
-    advance(workflow, task);
-    saveWorkflow(workflow, workflowPath);
-    emit({ type: 'DONE', task: task.name, status: 'success', output: attempt.output, ...(agentId ? { agent_id: agentId } : {}) });
+    postTaskSettlement(workflow, workflowPath, task, attempt, agentId);
     return;
   }
 }
@@ -1202,16 +1187,30 @@ function status(workflowPath) {
       const durationMs = (t.started_at && t.finished_at)
         ? new Date(t.finished_at).getTime() - new Date(t.started_at).getTime()
         : null;
+      // stuck detection: if this is the current task, has started_at, no
+      // finished_at on the latest attempt, and a timeout_ms is declared,
+      // report how long it's been running.
+      let stuckDurationMs = null;
+      const isRunning = workflow.context.current_task === t.name
+        && t.started_at
+        && last && !('status' in last);
+      if (isRunning) {
+        const elapsed = Date.now() - new Date(t.started_at).getTime();
+        stuckDurationMs = elapsed;
+      }
       return {
         name: t.name,
         phase: t.phase,
         requires_approval: t.requires_approval || false,
+        executor: t.executor || 'self',
+        timeout_ms: t.timeout_ms || null,
         attempts: hist.length,
         last_status: last ? (last.status || 'pending_approval') : 'pending',
         last_approval_status: last ? (last.approval_status || null) : null,
         started_at: t.started_at || null,
         finished_at: t.finished_at || null,
         duration_ms: durationMs,
+        stuck_duration_ms: stuckDurationMs,
       };
     }),
   });

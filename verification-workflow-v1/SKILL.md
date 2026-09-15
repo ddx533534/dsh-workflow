@@ -20,7 +20,7 @@ This skill provides a protocol-driven workflow for plan → code → verify loop
 
 1. The user triggers this skill with `/verification-workflow <requirement>`.
 2. **The Agent loads `rules.json` and obeys every rule throughout the run.** For sub-agents, the Agent includes the `target: "sub_agent"` rules in the sub-agent's prompt. These rules are hard constraints, not suggestions — violating them is a bug in the Agent's behavior.
-3. The Agent generates a `workflow.json` by **templating** — it only fills in `run_name` and uses the template's default config. Write to `.verification-workflow/run_<YYYYMMDDHHmmss>/.workflow.json`. `run_name`: English short name from the requirement; spaces/hyphens → underscores, camelCase → snake_case. Example: `change_label`.
+3. The Agent generates a `workflow.json` by **templating** — it fills in `run_name` and sets `context.user_requirement` to the user's original requirement text. Write to `.verification-workflow/run_<YYYYMMDDHHmmss>/.workflow.json`. `run_name`: English short name from the requirement; spaces/hyphens → underscores, camelCase → snake_case. Example: `change_label`.
 4. The Agent drives execution by repeatedly calling `node engine/loop.js --step`, maintaining an `agent_id_map` (declared_name → real agent_id) for sub-agent reuse. **The main Agent never touches the repository** — all business data collection (reading code, grepping, running commands) is done by sub-agents in their own context:
    - **`NEED_APPROVAL` → MUST stop and ask the user.** The Agent must never approve on its own — regardless of how low-risk the change appears. No "auto-approve for simple changes." The Agent calls `--approve` ONLY after the user explicitly says yes; calls `--reject "reason"` when the user says no. This is a hard rule, not a suggestion.
    - For `handler.type == "script"`: the engine executes the script directly.
@@ -45,10 +45,10 @@ See `protocol/schema.json` for the full definition. Core structure:
 
 - **Workflow** — root: `{ version, run_name, artifacts_dir?, project_root?, phases[], tasks[], loops[], context }`
 - **Phase** — major stage: `{ name, tasks[] }`
-- **Task** — concrete task: `{ name, phase, handler{type,ref}, executor?, depends_on?, input?, output?, started_at, finished_at, history[] }`
+- **Task** — concrete task: `{ name, phase, handler{type,ref}, executor?, depends_on?, input?, output?, requires_approval?, timeout_ms?, started_at, finished_at, history[] }`
 - **Attempt** — execution record: `{ attempt, status:"success"|"fail", output:{data, passed?} }`
 - **Loop** — backtrack config: `{ trigger_task, trigger_field, trigger_when, target_task, max_iterations }`
-- **Context** — runtime state: `{ current_phase, current_task, loop_counts{}, known_agents[], terminated, terminate_reason }`
+- **Context** — runtime state: `{ current_phase, current_task, user_requirement?, loop_counts{}, backtrack_counts{}, backtrack_log[], known_agents[], terminated, terminate_reason }`
 
 Handler types:
 - `skill` — a sub-skill under `skills/`, executed by the Agent or a sub-agent reading its prompt
@@ -59,3 +59,24 @@ Executor types (task.executor):
 - `subagent:<name>` — a named sub-agent executes. `<name>` is a **declared name** (e.g. "planner"), not a harness agent_id. Same declared name across tasks shares one sub-agent instance. The main Agent maps declared names to real agent_ids via `agent_id_map`.
 
 Adding a new task requires only a JSON declaration in `workflow.json`; the engine logic does not change.
+
+## request_backtrack (sub-agent initiated)
+
+Any sub-agent can request the engine to backtrack to a predecessor task by including a `request_backtrack` field in its output data:
+
+```json
+{
+  "... normal output fields ...": "...",
+  "request_backtrack": {
+    "to": "<predecessor_task_name>",
+    "reason": "What's wrong and why it needs revision"
+  }
+}
+```
+
+Rules (enforced by the engine, see `checkRequestBacktrack` in loop.js):
+- `to` must be a **predecessor** task (one that runs before the current task). Forward jumps are ignored.
+- Per-task counting: each task has its own budget (`max_backtrack_per_task`, default 3), regardless of which target it backtracks to.
+- If ignored (invalid target or limit exceeded), the workflow continues normally — the output is still recorded.
+- Declared loops (`checkLoops`) take priority over `request_backtrack`.
+- All requests (including ignored ones) are logged in `context.backtrack_log` for audit.
